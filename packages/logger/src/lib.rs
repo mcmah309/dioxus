@@ -82,6 +82,7 @@ pub fn init(level: Level) -> Result<(), SetGlobalDefaultError> {
 
     #[cfg(target_arch = "wasm32")]
     {
+        use tracing_subscriber::layer::Layer;
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::Registry;
 
@@ -89,10 +90,27 @@ pub fn init(level: Level) -> Result<(), SetGlobalDefaultError> {
             .set_max_level(level)
             .build();
         let layer = tracing_wasm::WASMLayer::new(layer_config);
-        let reg = Registry::default().with(layer);
-
-        console_error_panic_hook::set_once();
-        set_global_default(reg)
+        let reg;
+        #[cfg(feature = "env-filter")]
+        {
+            use tracing_subscriber::EnvFilter;
+            if let Some(filter_directive) = option_env!("RUST_LOG_BUILD_TIME") {
+                let layer = layer.with_filter(EnvFilter::new(filter_directive));
+                let reg = Registry::default().with(layer);
+                console_error_panic_hook::set_once();
+                set_global_default(reg)
+            } else {
+                reg = Registry::default().with(layer);
+                console_error_panic_hook::set_once();
+                set_global_default(reg)
+            }
+        }
+        #[cfg(not(feature = "env-filter"))]
+        {
+            let reg = Registry::default().with(layer);
+            console_error_panic_hook::set_once();
+            set_global_default(reg)
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
