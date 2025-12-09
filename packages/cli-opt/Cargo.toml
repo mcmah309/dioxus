@@ -32,11 +32,12 @@ png = "0.17.16"
 # Image format/conversion
 image = { version = "0.25", features = ["avif"] }
 
-# CSS Minification
+# CSS
 lightningcss = { version = "1.0.0-alpha.67", features = [
     "browserslist",
     "into_owned",
 ] }
+stylance-core = { workspace = true }
 
 # SCSS Processing
 grass = "0.13.4"

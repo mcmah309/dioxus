@@ -113,8 +113,7 @@ impl ToTokens for CssModuleParser {
                 #linker_tokens;
 
                 // Get the hash to use when builidng hashed css idents.
-                // const __ASSET_OPTIONS: manganis::AssetOptions = #options.into_asset_options();
-                // pub(super) const __ASSET_HASH: manganis::macro_helpers::const_serialize::ConstStr = manganis::macro_helpers::hash_asset(&__ASSET_OPTIONS, #hash);
+
 
                 // Css ident class for deref stylesheet inclusion.
                 pub(super) struct __CssIdent { pub inner: &'static str }

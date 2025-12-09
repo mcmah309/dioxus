@@ -23,7 +23,7 @@ dunce = { workspace = true }
 macro-string = { workspace = true }
 # stylance-core = "0.7.4"
 # stylance-core = { git = "https://github.com/mcmah309/stylance-rs.git", branch = "expose_parse", path = "internal/stylance-core" }
-stylance-core = { git = "https://github.com/mcmah309/stylance-rs.git", branch = "expose_parse" }
+stylance-core = { workspace = true }
 
 [features]
 default = []

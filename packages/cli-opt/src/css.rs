@@ -9,6 +9,7 @@ use lightningcss::{
     targets::{Browsers, Targets},
 };
 use manganis_core::{CssAssetOptions, CssModuleAssetOptions};
+use stylance_core::{hash_string, ClassNamePattern};
 
 pub(crate) fn process_css(
     css_options: &CssAssetOptions,
@@ -73,16 +74,21 @@ pub(crate) fn process_css_module(
         .strip_prefix(&src_name)
         .ok_or(anyhow!("Failed to read hash of css module."))?;
 
+    let hash = hash_string(&css);
+    let mut hash = format!("{hash:x}");
+    hash.truncate(7);
     // Rewrite CSS idents with ident+hash.
-    let (classes, ids) = manganis_core::collect_css_idents(&css);
+    let (css, _) =
+        stylance_core::create_new_css(css.as_str(), &ClassNamePattern::default(), hash.as_str())
+            .expect("Invalid css");
 
-    for class in classes {
-        css = css.replace(&format!(".{class}"), &format!(".{class}{hash}"));
-    }
+    // for class in classes {
+    //     css = css.replace(&format!(".{class}"), &format!(".{class}{hash}"));
+    // }
 
-    for id in ids {
-        css = css.replace(&format!("#{id}"), &format!("#{id}{hash}"));
-    }
+    // for id in ids {
+    //     css = css.replace(&format!("#{id}"), &format!("#{id}{hash}"));
+    // }
 
     // Minify CSS
     let css = if css_options.minified() {
