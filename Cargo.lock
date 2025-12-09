@@ -10349,6 +10349,7 @@ dependencies = [
  "manganis-core",
  "proc-macro2",
  "quote",
+ "stylance-core",
  "syn 2.0.104",
 ]
 
@@ -15406,6 +15407,18 @@ dependencies = [
  "quote",
  "rustversion",
  "syn 2.0.104",
+]
+
+[[package]]
+name = "stylance-core"
+version = "0.7.4"
+source = "git+https://github.com/mcmah309/stylance-rs.git?branch=expose_parse#d4ed3a08f90de253732092a8184b8e06a9960067"
+dependencies = [
+ "anyhow",
+ "serde",
+ "siphasher 1.0.1",
+ "toml 0.8.23",
+ "winnow 0.5.40",
 ]
 
 [[package]]
