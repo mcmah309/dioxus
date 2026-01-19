@@ -451,8 +451,15 @@ impl VNode {
                                     (AttributeValue::Float(l), AttributeValue::Float(r)) => l != r,
                                     (AttributeValue::Int(l), AttributeValue::Int(r)) => l != r,
                                     (AttributeValue::Bool(l), AttributeValue::Bool(r)) => l != r,
-                                    (AttributeValue::Any(l), AttributeValue::Any(r)) => {
+                                    (AttributeValue::RcSized(l), AttributeValue::RcSized(r)) => {
                                         !l.as_ref().any_cmp(r.as_ref())
+                                    }
+                                    (AttributeValue::ArcSized(l), AttributeValue::ArcSized(r)) => {
+                                        !l.as_ref().any_cmp(r.as_ref())
+                                    }
+                                    (AttributeValue::RcStr(l), AttributeValue::RcStr(r)) => l != r,
+                                    (AttributeValue::ArcStr(l), AttributeValue::ArcStr(r)) => {
+                                        l != r
                                     }
                                     (AttributeValue::None, AttributeValue::None) => false,
                                     (AttributeValue::Listener(_), AttributeValue::Listener(_)) => {

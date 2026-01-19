@@ -15,8 +15,8 @@ fn main() {
 fn app() -> Element {
     rsx! {
         div {
-            h1 { "This should show an image:" }
-            img { src: ASSET_PATH }
+     h1 { "This should show an image:" }
+        // img { src: ASSET_PATH }
         }
     }
 }

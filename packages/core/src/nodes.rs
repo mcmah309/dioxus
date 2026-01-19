@@ -7,7 +7,6 @@ use crate::{
     Element, Event, Properties, ScopeId, VirtualDom,
 };
 use dioxus_core_types::DioxusFormattable;
-use std::ops::Deref;
 use std::rc::Rc;
 use std::vec;
 use std::{
@@ -15,6 +14,7 @@ use std::{
     cell::Cell,
     fmt::{Arguments, Debug},
 };
+use std::{ops::Deref, sync::Arc};
 
 /// The information about the
 #[derive(Debug)]
@@ -762,8 +762,17 @@ pub enum AttributeValue {
     /// A listener, like "onclick"
     Listener(ListenerCallback),
 
-    /// An arbitrary value that implements PartialEq and is static
-    Any(Rc<dyn AnyValue>),
+    /// A reference-counted value that implements PartialEq, is static, and is Sized
+    RcSized(Rc<dyn AnyValue>),
+
+    /// A reference-counted str
+    RcStr(Rc<str>),
+
+    /// A atomically reference-counted value that implements PartialEq, is static, and is Sized
+    ArcSized(Arc<dyn AnyValue>),
+
+    /// An atomically reference-counted str
+    ArcStr(Arc<str>),
 
     /// A "none" value, resulting in the removal of an attribute from the dom
     None,
@@ -779,7 +788,7 @@ impl AttributeValue {
 
     /// Create a new [`AttributeValue`] with a value that implements [`AnyValue`]
     pub fn any_value<T: AnyValue>(value: T) -> AttributeValue {
-        AttributeValue::Any(Rc::new(value))
+        AttributeValue::RcSized(Rc::new(value))
     }
 }
 
@@ -791,7 +800,10 @@ impl std::fmt::Debug for AttributeValue {
             Self::Int(arg0) => f.debug_tuple("Int").field(arg0).finish(),
             Self::Bool(arg0) => f.debug_tuple("Bool").field(arg0).finish(),
             Self::Listener(_) => f.debug_tuple("Listener").finish(),
-            Self::Any(_) => f.debug_tuple("Any").finish(),
+            Self::RcSized(_) => f.debug_tuple("RcSized").finish(),
+            Self::RcStr(_) => f.debug_tuple("RcStr").finish(),
+            Self::ArcSized(_) => f.debug_tuple("ArcSized").finish(),
+            Self::ArcStr(_) => f.debug_tuple("ArcStr").finish(),
             Self::None => write!(f, "None"),
         }
     }
@@ -805,7 +817,10 @@ impl PartialEq for AttributeValue {
             (Self::Int(l0), Self::Int(r0)) => l0 == r0,
             (Self::Bool(l0), Self::Bool(r0)) => l0 == r0,
             (Self::Listener(l0), Self::Listener(r0)) => l0 == r0,
-            (Self::Any(l0), Self::Any(r0)) => l0.as_ref().any_cmp(r0.as_ref()),
+            (Self::RcSized(l0), Self::RcSized(r0)) => l0.as_ref().any_cmp(r0.as_ref()),
+            (Self::RcStr(l0), Self::RcStr(r0)) => **l0 == **r0,
+            (Self::ArcSized(l0), Self::ArcSized(r0)) => l0.as_ref().any_cmp(r0.as_ref()),
+            (Self::ArcStr(l0), Self::ArcStr(r0)) => **l0 == **r0,
             (Self::None, Self::None) => true,
             _ => false,
         }
@@ -1104,7 +1119,25 @@ impl IntoAttributeValue for Arguments<'_> {
 
 impl IntoAttributeValue for Rc<dyn AnyValue> {
     fn into_value(self) -> AttributeValue {
-        AttributeValue::Any(self)
+        AttributeValue::RcSized(self)
+    }
+}
+
+impl IntoAttributeValue for Rc<str> {
+    fn into_value(self) -> AttributeValue {
+        AttributeValue::RcStr(self)
+    }
+}
+
+impl IntoAttributeValue for Arc<dyn AnyValue> {
+    fn into_value(self) -> AttributeValue {
+        AttributeValue::ArcSized(self)
+    }
+}
+
+impl IntoAttributeValue for Arc<str> {
+    fn into_value(self) -> AttributeValue {
+        AttributeValue::ArcStr(self)
     }
 }
 
