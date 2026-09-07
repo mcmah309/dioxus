@@ -459,19 +459,6 @@ impl VirtualDom {
         }
     }
 
-    /// Wait until the scheduler has work without polling the task that produced it.
-    ///
-    /// Most renderers should use [`Self::wait_for_work`]. Event loops that need
-    /// to interleave an external event source with bounded Dioxus work can pair
-    /// this method with [`Self::render_immediate_with_work_limit`].
-    pub async fn wait_for_work_available(&mut self) {
-        self.queue_events();
-        if self.has_immediate_work() {
-            return;
-        }
-        self.wait_for_event().await;
-    }
-
     /// Wait for the next event to trigger and add it to the queue
     #[instrument(skip(self), level = "trace", name = "VirtualDom::wait_for_event")]
     async fn wait_for_event(&mut self) {
@@ -600,73 +587,6 @@ impl VirtualDom {
                 self.render_immediate_with_writer(&mut router);
             }
         }
-    }
-
-    /// Render at most `work_limit` ready tasks or scopes, returning whether more
-    /// immediately runnable work remains.
-    ///
-    /// Renderers that also drive an external event source can use this method to
-    /// keep a self-waking Dioxus task from monopolizing their event loop. A scope
-    /// rerender is always completed atomically, so every mutation batch produced
-    /// by this method is safe to apply before processing the next batch.
-    pub fn render_immediate_with_work_limit(
-        &mut self,
-        to: &mut impl crate::MultiWriter,
-        work_limit: usize,
-    ) -> bool {
-        self.queue_events();
-
-        let _runtime = RuntimeGuard::new(self.runtime.clone());
-        let mut router = crate::mutations::TargetRouter::new(to, self.runtime.clone());
-        let mut work_done = 0;
-        let mut rendered_scope = false;
-
-        while work_done < work_limit {
-            let Some(work) = self.pop_work() else {
-                // Effects must run after mutations from the preceding render have
-                // reached the renderer. If this call rendered a scope, leave its
-                // effects for the next call.
-                if rendered_scope {
-                    break;
-                }
-                let Some(effect) = self.pop_effect() else {
-                    break;
-                };
-                effect.run();
-                self.queue_events();
-                work_done += 1;
-                continue;
-            };
-
-            match work {
-                Work::PollTask(task) => {
-                    _ = self.runtime.handle_task_wakeup(task);
-                }
-                Work::RerunScope(scope) => {
-                    rendered_scope = true;
-                    self.runtime.clone().while_rendering(|| {
-                        self.run_and_diff_scope(Some(&mut router), scope.id);
-                    });
-                }
-            }
-
-            self.queue_events();
-            work_done += 1;
-        }
-
-        self.queue_events();
-        self.has_immediate_work()
-    }
-
-    fn has_immediate_work(&mut self) -> bool {
-        self.has_dirty_scopes()
-            || self
-                .runtime
-                .dirty_tasks
-                .borrow()
-                .values()
-                .any(|tasks| !tasks.is_empty())
-            || !self.runtime.pending_effects.borrow().is_empty()
     }
 
     fn rebuild_with_writer(&mut self, to: &mut dyn WriteMutations) {
