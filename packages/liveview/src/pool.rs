@@ -373,8 +373,10 @@ async fn run_with_uploads(
         let hot_reload_wait: std::future::Pending<Option<()>> = std::future::pending();
 
         tokio::select! {
-            // poll any futures or suspense
-            _ = vdom.wait_for_work() => {}
+            // Notice ready VDOM work without draining a self-waking task. The
+            // bounded render below gives the websocket another chance between
+            // every application task poll.
+            _ = vdom.wait_for_work_available() => {}
 
             Some(result) = upload_cleanups.next() => {
                 if let Ok(id) = result {
@@ -480,8 +482,11 @@ async fn run_with_uploads(
             }
         }
 
-        // render the vdom
-        vdom.render_immediate(&mut mutations);
+        // Keep application work cooperative with websocket input. In
+        // particular, a file event handler that performs many immediately-ready
+        // async operations must not prevent later events or upload batches from
+        // being received on this connection.
+        vdom.render_immediate_with_work_limit(&mut mutations, 1);
 
         if let Some(edits) = take_edits(&mut mutations) {
             ws.send(edits).await?;
