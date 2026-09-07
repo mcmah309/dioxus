@@ -30,7 +30,6 @@ export class NativeInterpreter extends JSChannel_ {
   // eventually we want to remove liveview and build it into the server-side-events of fullstack
   // however, for now we need to support it since WebSockets in fullstack doesn't exist yet
   liveview: boolean;
-  private liveviewEventQueue: Promise<void> = Promise.resolve();
 
   constructor(baseUri: string, headless: boolean) {
     super();
@@ -344,13 +343,14 @@ export class NativeInterpreter extends JSChannel_ {
       bubbles,
     };
 
+    let entries: [string, FormDataEntryValue][] | undefined;
     if (this.liveview) {
       // Don't re-upload files when other form fields change.
       const uploadFiles = target instanceof HTMLElement &&
         (name === "submit" ||
           (target instanceof HTMLInputElement && target.type === "file" &&
             (name === "input" || name === "change")));
-      const entries = uploadFiles ? this.snapshotFormEntries(target) : undefined;
+      entries = uploadFiles ? this.snapshotFormEntries(target) : undefined;
 
       // Preserve unselected file fields as File(None).
       if (contents.values) {
@@ -360,21 +360,9 @@ export class NativeInterpreter extends JSChannel_ {
             : value
         );
       }
-
-      // Send events in order, even when a file read is slow.
-      this.liveviewEventQueue = this.liveviewEventQueue.then(async () => {
-        if (entries) {
-          await this.sendLiveviewFileEvent(body, entries);
-        } else {
-          this.sendSerializedEvent(body);
-        }
-      }).catch((error) => {
-        console.error("Failed to send LiveView event", error);
-      });
-      return;
     }
 
-    const response = this.sendSerializedEvent(body);
+    const response = this.sendSerializedEvent(body, entries);
     // capture/prevent default of the event if the virtualdom wants to
     if (response) {
       if (response.preventDefault) {
@@ -397,9 +385,12 @@ export class NativeInterpreter extends JSChannel_ {
     element: number;
     data: any;
     bubbles: boolean;
-  }): EventSyncResult | void {
+  }, entries?: [string, FormDataEntryValue][]): EventSyncResult | void {
     if (this.liveview) {
-      this.sendIpcMessage("user_event", body);
+      // Start each event immediately and report both synchronous send errors and upload failures.
+      this.sendLiveviewEvent(body, entries).catch((error) => {
+        console.error("Failed to send LiveView event", error);
+      });
     } else {
       // Run the event handler on the virtualdom
       return handleVirtualdomEventSync(this.eventsPath, JSON.stringify(body));
@@ -536,10 +527,15 @@ export class NativeInterpreter extends JSChannel_ {
     return entries;
   }
 
-  private async sendLiveviewFileEvent(
+  private async sendLiveviewEvent(
     body: { name: string; element: number; data: any; bubbles: boolean },
-    entries: [string, FormDataEntryValue][]
+    entries?: [string, FormDataEntryValue][]
   ): Promise<void> {
+    if (!entries) {
+      this.sendIpcMessage("user_event", body);
+      return;
+    }
+
     const values: SerializedFormObject[] = [];
     const files: File[] = [];
 
@@ -569,7 +565,7 @@ export class NativeInterpreter extends JSChannel_ {
 
     body.data.values = values;
     if (files.length === 0) {
-      this.sendSerializedEvent(body);
+      this.sendIpcMessage("user_event", body);
       return;
     }
 
@@ -578,23 +574,30 @@ export class NativeInterpreter extends JSChannel_ {
       throw new Error("LiveView file upload size exceeds JavaScript's safe integer range");
     }
 
-    let uploadStarted = false;
+    let uploadId: number | undefined;
+    const controller = new AbortController();
     try {
-      const credentials = await this.ipc.beginFileUpload({ size, event: body });
-      uploadStarted = true;
-      if (!Array.isArray(credentials) || credentials.length !== files.length) {
+      const { id, tokens } = await this.ipc.beginFileUpload({ size, event: body });
+      uploadId = id;
+      if (!Array.isArray(tokens) || tokens.length !== files.length) {
         throw new Error("LiveView returned invalid file upload credentials");
       }
-      for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
-        await this.ipc.uploadFile(credentials[fileIndex], files[fileIndex]);
-      }
+      // Limit parallel requests within each batch while allowing other batches to progress.
+      let nextFile = 0;
+      await Promise.all(Array.from({ length: Math.min(4, files.length) }, async () => {
+        while (!controller.signal.aborted && nextFile < files.length) {
+          const fileIndex = nextFile++;
+          await this.ipc.uploadFile(tokens[fileIndex], files[fileIndex], controller.signal);
+        }
+      }));
       // An HTTP success can come from an app's fallback route. Wait for LiveView to
-      // confirm it received the files before allowing the next event to start.
-      await this.ipc.completeFileUpload();
+      // confirm it received this batch, without blocking any other events.
+      await this.ipc.completeFileUpload(id);
     } catch (error) {
-      if (uploadStarted) {
+      controller.abort();
+      if (uploadId !== undefined) {
         try {
-          this.sendIpcMessage("file_upload_cancel");
+          this.ipc.cancelFileUpload(uploadId);
         } catch {
           // The websocket may be the reason the upload failed.
         }

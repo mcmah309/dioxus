@@ -13,9 +13,14 @@ use crate::{
 use dioxus_core::{Element, Event, ScopeId, VirtualDom, provide_context};
 use dioxus_html::{EventData, HtmlEvent, PlatformEventData};
 use dioxus_interpreter_js::MutationState;
-use futures_util::{SinkExt, StreamExt, pin_mut};
+use futures_util::{
+    SinkExt, StreamExt,
+    future::{AbortHandle, Abortable},
+    pin_mut,
+    stream::FuturesUnordered,
+};
 use serde::{Deserialize, Serialize};
-use std::{any::Any, rc::Rc, sync::Arc};
+use std::{any::Any, collections::HashMap, rc::Rc, sync::Arc};
 use tokio_util::task::LocalPoolHandle;
 
 #[derive(Deserialize, Debug)]
@@ -25,23 +30,21 @@ struct FileUploadStart {
 }
 
 #[derive(Deserialize, Debug)]
-struct FileUploadCancel {}
-
-#[derive(Deserialize, Debug)]
-struct FileUploadComplete {}
-
-#[derive(Deserialize, Debug)]
 #[serde(tag = "method", content = "params")]
 enum IpcMessage {
     #[serde(rename = "user_event")]
     Event(Box<HtmlEvent>),
     // Validate upload metadata in the handler so malformed requests receive an error response.
     #[serde(rename = "file_upload")]
-    FileUpload(serde_json::Value),
+    FileUpload {
+        id: u64,
+        #[serde(flatten)]
+        metadata: serde_json::Value,
+    },
     #[serde(rename = "file_upload_cancel")]
-    FileUploadCancel(FileUploadCancel),
+    FileUploadCancel { id: u64 },
     #[serde(rename = "file_upload_complete")]
-    FileUploadComplete(FileUploadComplete),
+    FileUploadComplete { id: u64 },
     #[serde(rename = "query")]
     Query(QueryResult),
 }
@@ -51,6 +54,7 @@ struct PendingFileUpload {
     file_count: usize,
     tokens: Vec<String>,
     uploads: crate::upload::FileUploadRegistry,
+    cleanup: Option<AbortHandle>,
 }
 
 impl PendingFileUpload {
@@ -88,6 +92,7 @@ impl PendingFileUpload {
             file_count: sizes.len(),
             tokens,
             uploads,
+            cleanup: None,
         })
     }
 
@@ -96,6 +101,10 @@ impl PendingFileUpload {
     }
 
     fn cancel(&mut self) {
+        // Retire the waiter before this ID can be reused by another batch.
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup.abort();
+        }
         self.uploads.cancel(&self.tokens);
         self.tokens.clear();
     }
@@ -117,10 +126,6 @@ impl Drop for PendingFileUpload {
     fn drop(&mut self) {
         self.cancel();
     }
-}
-
-fn file_upload_failed(error: impl ToString) -> LiveViewError {
-    LiveViewError::FileUploadFailed(error.to_string())
 }
 
 fn dispatch_event(
@@ -358,7 +363,8 @@ async fn run_with_uploads(
     }
 
     let upload_session = uploads.new_session();
-    let mut pending_file_upload: Option<PendingFileUpload> = None;
+    let mut pending_file_uploads = HashMap::<u64, PendingFileUpload>::new();
+    let mut upload_cleanups = FuturesUnordered::new();
 
     loop {
         #[cfg(all(feature = "devtools", debug_assertions))]
@@ -370,13 +376,10 @@ async fn run_with_uploads(
             // poll any futures or suspense
             _ = vdom.wait_for_work() => {}
 
-            _ = async {
-                match &pending_file_upload {
-                    Some(upload) => uploads.wait_for_cleanup(&upload.tokens).await,
-                    None => std::future::pending().await,
+            Some(result) = upload_cleanups.next() => {
+                if let Ok(id) = result {
+                    pending_file_uploads.remove(&id);
                 }
-            } => {
-                pending_file_upload = None;
             }
 
             evt = ws.next() => {
@@ -391,41 +394,48 @@ async fn run_with_uploads(
                                 IpcMessage::Event(evt) => {
                                     dispatch_event(&vdom, &query_engine, evt, Vec::new());
                                 }
-                                IpcMessage::FileUpload(upload) => {
-                                    if pending_file_upload.is_some() {
-                                        return Err(file_upload_failed(
-                                            "received a new file upload before the previous upload completed",
-                                        ));
-                                    }
-                                    let upload = serde_json::from_value::<FileUploadStart>(upload)
-                                        .map_err(|error| format!("invalid file upload metadata: {error}"))
-                                        .and_then(|upload| PendingFileUpload::new(upload, uploads.clone(), &upload_session));
+                                IpcMessage::FileUpload { id, metadata } => {
+                                    let upload = if pending_file_uploads.contains_key(&id) {
+                                        Err("received a duplicate file upload ID".to_string())
+                                    } else {
+                                        serde_json::from_value::<FileUploadStart>(metadata)
+                                            .map_err(|error| format!("invalid file upload metadata: {error}"))
+                                            .and_then(|upload| PendingFileUpload::new(upload, uploads.clone(), &upload_session))
+                                    };
                                     let response = match upload {
-                                        Ok(upload) => {
-                                            let credentials = upload.credentials();
-                                            pending_file_upload = Some(upload);
-                                            ClientUpdate::FileUpload(credentials)
+                                        Ok(mut upload) => {
+                                            let tokens = upload.credentials();
+                                            let cleanup_tokens = tokens.clone();
+                                            let cleanup_uploads = uploads.clone();
+                                            let (abort, registration) = AbortHandle::new_pair();
+                                            upload.cleanup = Some(abort);
+                                            upload_cleanups.push(Abortable::new(async move {
+                                                cleanup_uploads.wait_for_cleanup(&cleanup_tokens).await;
+                                                id
+                                            }, registration));
+                                            pending_file_uploads.insert(id, upload);
+                                            ClientUpdate::FileUpload { id, tokens }
                                         }
-                                        Err(error) => ClientUpdate::FileUploadError(error),
+                                        Err(error) => ClientUpdate::FileUploadError { id, error },
                                     };
                                     ws.send(text_frame(
                                         &serde_json::to_string(&response).unwrap(),
                                     ))
                                     .await?;
                                 }
-                                IpcMessage::FileUploadCancel(_) => {
-                                    pending_file_upload = None;
+                                IpcMessage::FileUploadCancel { id } => {
+                                    pending_file_uploads.remove(&id);
                                 }
-                                IpcMessage::FileUploadComplete(_) => {
-                                    let result = pending_file_upload.take().ok_or_else(|| {
+                                IpcMessage::FileUploadComplete { id } => {
+                                    let result = pending_file_uploads.remove(&id).ok_or_else(|| {
                                         "received file upload completion without a pending upload".to_string()
                                     }).and_then(PendingFileUpload::finish);
                                     let response = match result {
                                         Ok((event, files)) => {
                                             dispatch_event(&vdom, &query_engine, event, files);
-                                            ClientUpdate::FileUploadComplete
+                                            ClientUpdate::FileUploadComplete { id }
                                         }
-                                        Err(error) => ClientUpdate::FileUploadError(error),
+                                        Err(error) => ClientUpdate::FileUploadError { id, error },
                                     };
                                     ws.send(text_frame(
                                         &serde_json::to_string(&response).unwrap(),
@@ -498,21 +508,244 @@ enum ClientUpdate {
     #[serde(rename = "query")]
     Query(String),
     #[serde(rename = "file_upload")]
-    FileUpload(Vec<String>),
+    FileUpload { id: u64, tokens: Vec<String> },
     #[serde(rename = "file_upload_complete")]
-    FileUploadComplete,
+    FileUploadComplete { id: u64 },
     #[serde(rename = "file_upload_error")]
-    FileUploadError(String),
+    FileUploadError { id: u64, error: String },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+    use futures_util::{Sink, Stream};
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+        time::Duration,
+    };
+
+    struct TestSocket {
+        incoming: UnboundedReceiver<Result<Vec<u8>, LiveViewError>>,
+        outgoing: UnboundedSender<Vec<u8>>,
+    }
+
+    impl Stream for TestSocket {
+        type Item = Result<Vec<u8>, LiveViewError>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Pin::new(&mut self.incoming).poll_next(cx)
+        }
+    }
+
+    impl Sink<Vec<u8>> for TestSocket {
+        type Error = LiveViewError;
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: Vec<u8>) -> Result<(), Self::Error> {
+            self.outgoing
+                .unbounded_send(item)
+                .map_err(|_| LiveViewError::SendingFailed)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct TestConnection {
+        tx: UnboundedSender<Result<Vec<u8>, LiveViewError>>,
+        rx: UnboundedReceiver<Vec<u8>>,
+        server: tokio::task::JoinHandle<Result<(), LiveViewError>>,
+    }
+
+    impl TestConnection {
+        fn new(uploads: crate::upload::FileUploadRegistry) -> Self {
+            let (tx, incoming) = unbounded();
+            let (outgoing, rx) = unbounded();
+            let socket = TestSocket { incoming, outgoing };
+            let server = tokio::task::spawn_local(run_with_uploads(
+                VirtualDom::new(dioxus_core::VNode::empty),
+                socket,
+                uploads,
+            ));
+            Self { tx, rx, server }
+        }
+
+        fn send(&self, method: &str, params: serde_json::Value) {
+            self.tx
+                .unbounded_send(Ok(serde_json::to_vec(&serde_json::json!({
+                    "method": method, "params": params,
+                }))
+                .unwrap()))
+                .unwrap();
+        }
+
+        fn register(&self, id: u64, size: u64) {
+            self.send(
+                "file_upload",
+                serde_json::json!({
+                    "id": id, "size": size,
+                    "event": {
+                        "element": 0, "name": "change", "bubbles": true,
+                        "data": { "values": [{ "key": "file", "file": {
+                            "path": "upload.bin", "size": size, "last_modified": 0,
+                            "content_type": "application/octet-stream",
+                        } }] },
+                    },
+                }),
+            );
+        }
+
+        async fn receive(&mut self, kind: &str, id: u64) -> serde_json::Value {
+            let response = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let frame = self.rx.next().await.expect("connection should stay open");
+                    if frame[0] == 0 {
+                        let message: serde_json::Value =
+                            serde_json::from_slice(&frame[1..]).unwrap();
+                        if message["type"] != "query" {
+                            break message;
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("server should respond without waiting for another upload");
+            assert_eq!(response["type"], kind);
+            assert_eq!(response["data"]["id"], id);
+            response["data"].clone()
+        }
+
+        async fn token(&mut self, id: u64) -> String {
+            self.receive("file_upload", id).await["tokens"][0]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+
+        async fn close(self) {
+            drop(self.tx);
+            self.server.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_batches_share_quota_and_clean_up_independently() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let uploads = crate::upload::FileUploadRegistry::new(6);
+                let mut client = TestConnection::new(uploads.clone());
+                client.register(1, 3);
+                client.register(2, 3);
+                let first = client.token(1).await;
+                let second = client.token(2).await;
+                client.register(3, 1);
+                assert!(
+                    client.receive("file_upload_error", 3).await["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("upload data limit")
+                );
+
+                // A duplicate ID must not replace or cancel the original batch.
+                client.register(1, 0);
+                assert!(
+                    client.receive("file_upload_error", 1).await["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("duplicate")
+                );
+                let mut file = uploads.begin(&first, Some(3)).await.unwrap();
+                file.write(bytes::Bytes::from_static(b"abc")).await.unwrap();
+                file.finish().unwrap();
+
+                // Cancel and immediately reuse an ID before its old cleanup future is drained.
+                client.send("file_upload_cancel", serde_json::json!({ "id": 1 }));
+                client.register(1, 3);
+                let replacement = client.token(1).await;
+                assert!(matches!(
+                    uploads.begin(&first, None).await,
+                    Err(crate::upload::UploadError::UnknownOrExpired)
+                ));
+                let mut file = uploads.begin(&second, Some(3)).await.unwrap();
+                file.write(bytes::Bytes::from_static(b"def")).await.unwrap();
+                file.finish().unwrap();
+                client.send("file_upload_complete", serde_json::json!({ "id": 2 }));
+                client.receive("file_upload_complete", 2).await;
+
+                client.register(3, 3);
+                let third = client.token(3).await;
+                client.register(4, 1);
+                client.receive("file_upload_error", 4).await;
+                client.send("file_upload_complete", serde_json::json!({ "id": 999 }));
+                client.receive("file_upload_error", 999).await;
+                let file = uploads.begin(&replacement, Some(3)).await.unwrap();
+
+                // Disconnect cancels both active and unused batches.
+                client.close().await;
+                file.cancelled().await;
+                assert!(matches!(
+                    uploads.begin(&replacement, None).await,
+                    Err(crate::upload::UploadError::UnknownOrExpired)
+                ));
+                assert!(matches!(
+                    uploads.begin(&third, None).await,
+                    Err(crate::upload::UploadError::UnknownOrExpired)
+                ));
+            })
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_batch_does_not_cancel_another_active_batch() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let uploads =
+                    crate::upload::FileUploadRegistry::new(3).with_timeout(Duration::from_secs(10));
+                let mut client = TestConnection::new(uploads.clone());
+                client.register(1, 1);
+                client.register(2, 2);
+                let first = client.token(1).await;
+                let second = client.token(2).await;
+                let mut file = uploads.begin(&second, Some(2)).await.unwrap();
+
+                tokio::time::advance(Duration::from_secs(11)).await;
+                client.send("file_upload_complete", serde_json::json!({ "id": 1 }));
+                client.receive("file_upload_error", 1).await;
+                assert!(matches!(
+                    uploads.begin(&first, None).await,
+                    Err(crate::upload::UploadError::UnknownOrExpired)
+                ));
+                client.register(3, 1);
+                let third = client.token(3).await;
+
+                file.write(bytes::Bytes::from_static(b"ok")).await.unwrap();
+                file.finish().unwrap();
+                client.send("file_upload_complete", serde_json::json!({ "id": 2 }));
+                client.receive("file_upload_complete", 2).await;
+                client.close().await;
+                assert!(matches!(
+                    uploads.begin(&third, None).await,
+                    Err(crate::upload::UploadError::UnknownOrExpired)
+                ));
+            })
+            .await;
+    }
 
     fn pending_upload(uploads: crate::upload::FileUploadRegistry) -> PendingFileUpload {
         let message: IpcMessage = serde_json::from_value(serde_json::json!({
             "method": "file_upload",
             "params": {
+                "id": 0,
                 "size": 3,
                 "event": {
                     "element": 0,
@@ -545,7 +778,10 @@ mod tests {
             }
         }))
         .unwrap();
-        let IpcMessage::FileUpload(upload) = message else {
+        let IpcMessage::FileUpload {
+            metadata: upload, ..
+        } = message
+        else {
             unreachable!()
         };
         PendingFileUpload::new(

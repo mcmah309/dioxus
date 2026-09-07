@@ -75,6 +75,16 @@ redirect at the upload URL cannot receive the file, even if it returns HTTP succ
 LiveView confirms receipt over the WebSocket before dispatching the form event;
 failed uploads report an error and leave the connection available for retrying.
 
+Multiple upload events can run concurrently on one connection. Each batch has its
+own credentials, completion response, cancellation, and timeout; all batches and
+retained files share the connection's data limit. The browser sends up to four
+files concurrently within each batch and preserves the selection's file order in
+the delivered event.
+
+Clicks, text edits, and other events proceed while files upload. Events carrying
+files are dispatched only after their own batch completes, so they can arrive
+after later UI events or faster uploads, including uploads from the same input.
+
 Omitted settings keep their defaults. A file's declared size counts toward the cap
 from registration until its last `FileData` handle or reader is dropped. Dropping
 the last handle deletes the temporary file and releases its quota. Canceled and

@@ -34,12 +34,12 @@ class IPC {
 
     ws.onclose = () => {
       clearInterval(pingInterval);
-      if (this.pendingFileUpload) {
-        this.pendingFileUpload.reject(
+      for (const upload of this.pendingFileUploads.values()) {
+        upload.reject(
           new Error("LiveView websocket closed during a file upload")
         );
-        this.pendingFileUpload = null;
       }
+      this.pendingFileUploads.clear();
     };
 
     ws.onmessage = (message) => {
@@ -65,24 +65,27 @@ class IPC {
               break;
             case "file_upload":
             case "file_upload_complete":
-            case "file_upload_error":
-              if (!this.pendingFileUpload) {
+            case "file_upload_error": {
+              const upload = this.pendingFileUploads.get(event.data.id);
+              if (!upload) {
                 throw new Error("Received an unexpected LiveView file upload response");
               }
+              this.pendingFileUploads.delete(event.data.id);
               if (event.type === "file_upload_error") {
-                this.pendingFileUpload.reject(new Error(event.data));
+                upload.reject(new Error(event.data.error));
               } else {
-                this.pendingFileUpload.resolve(event.data);
+                upload.resolve(event.data);
               }
-              this.pendingFileUpload = null;
               break;
+            }
           }
         }
       }
     };
 
     this.ws = ws;
-    this.pendingFileUpload = null;
+    this.pendingFileUploads = new Map();
+    this.nextFileUploadId = 0;
   }
 
   postMessage(msg) {
@@ -90,32 +93,36 @@ class IPC {
   }
 
   beginFileUpload(params) {
-    return this.requestFileUpload("file_upload", params);
+    return this.requestFileUpload("file_upload", { ...params, id: this.nextFileUploadId++ });
   }
 
-  completeFileUpload() {
-    return this.requestFileUpload("file_upload_complete", {});
+  completeFileUpload(id) {
+    return this.requestFileUpload("file_upload_complete", { id });
+  }
+
+  cancelFileUpload(id) {
+    this.postMessage(JSON.stringify({ method: "file_upload_cancel", params: { id } }));
   }
 
   requestFileUpload(method, params) {
-    if (this.pendingFileUpload) {
-      return Promise.reject(new Error("A LiveView file upload is already pending"));
+    if (this.pendingFileUploads.has(params.id)) {
+      return Promise.reject(new Error("A request for this LiveView file upload is already pending"));
     }
     if (this.ws.readyState !== WebSocket.OPEN) {
       return Promise.reject(new Error("LiveView websocket is not open"));
     }
     return new Promise((resolve, reject) => {
-      this.pendingFileUpload = { resolve, reject };
+      this.pendingFileUploads.set(params.id, { resolve, reject });
       try {
         this.ws.send(JSON.stringify({ method, params }));
       } catch (error) {
-        this.pendingFileUpload = null;
+        this.pendingFileUploads.delete(params.id);
         reject(error);
       }
     });
   }
 
-  async uploadFile(token, file) {
+  async uploadFile(token, file, signal) {
     const url = new URL(this.ws.url);
     url.protocol = url.protocol === "wss:" ? "https:" : "http:";
     url.pathname = `${url.pathname.replace(/\/$/, "")}/upload/${encodeURIComponent(token)}`;
@@ -132,6 +139,7 @@ class IPC {
         "X-Request-Client": "dioxus",
       },
       body: file,
+      signal,
     });
     if (!response.ok) {
       throw new Error(`LiveView file upload failed with status ${response.status}`);
