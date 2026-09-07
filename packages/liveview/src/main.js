@@ -15,14 +15,17 @@ class IPC {
     window.interpreter.ipc = this;
     const ws = new WebSocket(WS_ADDR);
     ws.binaryType = "arraybuffer";
+    let pingInterval;
 
     function ping() {
-      ws.send("__ping__");
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send("__ping__");
+      }
     }
 
     ws.onopen = () => {
       // we ping every 30 seconds to keep the websocket alive
-      setInterval(ping, 30000);
+      pingInterval = setInterval(ping, 30000);
     };
 
     ws.onerror = (err) => {
@@ -30,9 +33,10 @@ class IPC {
     };
 
     ws.onclose = () => {
+      clearInterval(pingInterval);
       if (this.pendingFileUpload) {
         this.pendingFileUpload.reject(
-          new Error("LiveView websocket closed while creating a file upload")
+          new Error("LiveView websocket closed during a file upload")
         );
         this.pendingFileUpload = null;
       }
@@ -60,6 +64,7 @@ class IPC {
               Function("Eval", `"use strict";${event.data};`)();
               break;
             case "file_upload":
+            case "file_upload_complete":
             case "file_upload_error":
               if (!this.pendingFileUpload) {
                 throw new Error("Received an unexpected LiveView file upload response");
@@ -85,6 +90,14 @@ class IPC {
   }
 
   beginFileUpload(params) {
+    return this.requestFileUpload("file_upload", params);
+  }
+
+  completeFileUpload() {
+    return this.requestFileUpload("file_upload_complete", {});
+  }
+
+  requestFileUpload(method, params) {
     if (this.pendingFileUpload) {
       return Promise.reject(new Error("A LiveView file upload is already pending"));
     }
@@ -94,7 +107,7 @@ class IPC {
     return new Promise((resolve, reject) => {
       this.pendingFileUpload = { resolve, reject };
       try {
-        this.ws.send(JSON.stringify({ method: "file_upload", params }));
+        this.ws.send(JSON.stringify({ method, params }));
       } catch (error) {
         this.pendingFileUpload = null;
         reject(error);

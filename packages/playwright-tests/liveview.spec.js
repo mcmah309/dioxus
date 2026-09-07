@@ -465,3 +465,94 @@ test("a failed HTTP upload does not block subsequent events", async ({ page }) =
   expect(errors.filter((message) => message.includes("Failed to send LiveView event"))).toHaveLength(2);
   expect(unhandled).toEqual([]);
 });
+
+test("file events wait for the server to confirm upload completion", async ({ page }) => {
+  await page.goto("http://127.0.0.1:3030");
+  await expect(page.locator(".onmounted-div")).toHaveText("onmounted was called 1 times");
+  await page.evaluate(() => {
+    const ws = window.ipc.ws;
+    const onmessage = ws.onmessage;
+    let held = false;
+    ws.onmessage = (message) => {
+      const bytes = new Uint8Array(message.data);
+      if (!held && bytes[0] === 0 &&
+          new TextDecoder().decode(bytes.slice(1)).includes('"file_upload_complete"')) {
+        held = true;
+        Object.assign(window, { releaseUploadCompletion: () => onmessage(message) });
+      } else {
+        onmessage(message);
+      }
+    };
+  });
+  await page.locator("#file-picker").setInputFiles({
+    name: "hello.txt", mimeType: "text/plain", buffer: Buffer.from("hello"),
+  });
+  await expect.poll(() => page.evaluate(() => typeof window.releaseUploadCompletion)).toBe("function");
+  await expect(page.locator("#file-picker-counts")).toHaveText("1,0");
+  await page.getByRole("button", { name: "Increment" }).click();
+  await expect(page.locator("#main")).toContainText("hello axum! 0");
+
+  await page.evaluate(() => window.releaseUploadCompletion());
+  await expect(page.locator("#file-picker-counts")).toHaveText("1,1");
+  await expect(page.locator("#main")).toContainText("hello axum! 1");
+});
+
+for (const status of [200, 204]) {
+  test(`an upload handled by a fallback route keeps the connection usable (${status})`, async ({ page }) => {
+    const errors = [];
+    const unhandled = [];
+    let closed = false;
+    page.on("console", (message) => {
+      if (message.type() === "error") errors.push(message.text());
+    });
+    page.on("pageerror", (error) => unhandled.push(error));
+    page.on("websocket", (socket) => {
+      socket.on("close", () => { closed = true; });
+    });
+    // A custom router can return success without ever receiving the file into LiveView.
+    await page.route("**/ws/upload/*", (route) => route.fulfill({
+      status,
+      contentType: "text/html",
+      body: status === 200 ? "<!doctype html><html>Application fallback</html>" : "",
+    }));
+    await page.goto("http://127.0.0.1:3030");
+    const picker = page.locator("#file-picker");
+    const file = { name: "hello.txt", mimeType: "text/plain", buffer: Buffer.from("hello") };
+    await picker.setInputFiles(file);
+    await expect.poll(() => errors.filter((message) => message.includes("HTTP upload handler")).length).toBe(2);
+    await expect(page.locator("#file-picker-counts")).toHaveText("0,0");
+    await page.getByRole("button", { name: "Increment" }).click();
+    await expect(page.locator("#main")).toContainText("hello axum! 1");
+
+    await page.unroute("**/ws/upload/*");
+    await picker.setInputFiles(file);
+    await expect(page.locator("#file-picker-text")).toHaveText("hello");
+    await expect(page.locator("#file-picker-counts")).toHaveText("1,1");
+    expect(closed).toBe(false);
+    expect(unhandled).toEqual([]);
+    expect(errors).toHaveLength(2);
+  });
+}
+
+test("the keepalive timer stops when the websocket closes", async ({ page }) => {
+  const errors = [];
+  let pings = 0;
+  page.on("console", (message) => {
+    if (message.type() === "error") errors.push(message.text());
+  });
+  page.on("websocket", (socket) => {
+    socket.on("framesent", ({ payload }) => {
+      if (payload === "__ping__") pings++;
+    });
+  });
+  await page.clock.install();
+  await page.goto("http://127.0.0.1:3030");
+  await expect(page.locator(".onmounted-div")).toHaveText("onmounted was called 1 times");
+  await page.clock.runFor(30000);
+  await expect.poll(() => pings).toBe(1);
+  await page.evaluate(() => window.ipc.ws.close());
+  await expect.poll(() => page.evaluate(() => window.ipc.ws.readyState)).toBe(3);
+  await page.clock.runFor(60000);
+  expect(pings).toBe(1);
+  expect(errors).toEqual([]);
+});

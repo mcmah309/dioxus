@@ -51,6 +51,30 @@ let view = LiveViewPool::new()
     .with_upload_timeout(Duration::from_secs(60));
 ```
 
+If your app builds its own Axum router, mount the HTTP upload handler alongside
+the WebSocket route. For a WebSocket at `/ws`, add this route using a clone of the
+same pool that runs the WebSocket connection. These Axum examples require the
+`axum` feature on `dioxus-liveview`:
+
+```rust
+# #[cfg(feature = "axum")]
+# {
+use dioxus_liveview::LiveViewPool;
+
+let view = LiveViewPool::new();
+let router: axum::Router = axum::Router::new().route(
+    "/ws/upload/{token}",
+    dioxus_liveview::axum_file_upload(view.clone()),
+);
+# }
+```
+
+Append `/upload/{token}` to your actual WebSocket path, including any route prefix.
+The default LiveView router already mounts this handler. A fallback page or a
+redirect at the upload URL cannot receive the file, even if it returns HTTP success.
+LiveView confirms receipt over the WebSocket before dispatching the form event;
+failed uploads report an error and leave the connection available for retrying.
+
 Omitted settings keep their defaults. A file's declared size counts toward the cap
 from registration until its last `FileData` handle or reader is dropped. Dropping
 the last handle deletes the temporary file and releases its quota. Canceled and
@@ -79,12 +103,17 @@ destination origin's credentials. If that URL is cross-origin, configure CORS on
 the upload router with the exact page origin. Credentialed CORS cannot use a
 wildcard origin. The upload request uses `PUT` with `Content-Type`,
 `Content-Disposition`, `X-Content-Size`, and `X-Request-Client` headers, so the CORS
-layer must allow that method and those headers. For example:
+layer must allow that method and those headers. Enable the `cors` feature on
+`tower-http` for this example:
 
 ```rust
+# #[cfg(feature = "axum")]
+# {
 use axum::http::{header, HeaderName, HeaderValue, Method};
+use dioxus_liveview::LiveViewPool;
 use tower_http::cors::CorsLayer;
 
+let view = LiveViewPool::new();
 let upload_cors = CorsLayer::new()
     .allow_origin(HeaderValue::from_static("https://app.example.com"))
     .allow_methods([Method::PUT])
@@ -96,9 +125,10 @@ let upload_cors = CorsLayer::new()
     ])
     .allow_credentials(true);
 
-let upload_router = axum::Router::new()
+let upload_router: axum::Router = axum::Router::new()
     .route("/ws/upload/{token}", dioxus_liveview::axum_file_upload(view))
     .layer(upload_cors);
+# }
 ```
 
 ## Contributing

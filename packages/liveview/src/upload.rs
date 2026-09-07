@@ -33,6 +33,8 @@ pub(crate) enum UploadError {
     BodyReadFailed,
     #[error("LiveView file upload size did not match the declared size")]
     SizeMismatch,
+    #[error("LiveView did not receive every file through its HTTP upload handler; mount axum_file_upload at the WebSocket path followed by /upload/{{token}} using the same LiveViewPool")]
+    Incomplete,
 }
 
 fn storage_failed(error: impl ToString) -> UploadError {
@@ -302,7 +304,7 @@ impl FileUploadRegistry {
                 return Err(UploadError::Canceled);
             }
             if !matches!(*upload.state.lock().unwrap(), UploadState::Complete(_)) {
-                return Err(UploadError::SizeMismatch);
+                return Err(UploadError::Incomplete);
             }
         }
         Ok(tokens
@@ -664,6 +666,37 @@ mod tests {
             registry.begin(&token, Some(3)).await,
             Err(UploadError::UnknownOrExpired)
         ));
+    }
+
+    #[tokio::test]
+    async fn completion_requires_every_http_upload_to_finish() {
+        let registry = FileUploadRegistry::default();
+        let session = registry.new_session();
+        let tokens = registry.register(&session, &[1, 0]).unwrap();
+        assert!(matches!(
+            registry.take_completed(&tokens),
+            Err(UploadError::Incomplete)
+        ));
+
+        let mut first = registry.begin(&tokens[0], Some(1)).await.unwrap();
+        assert!(matches!(
+            registry.take_completed(&tokens),
+            Err(UploadError::Incomplete)
+        ));
+        first.write(Bytes::from_static(b"x")).await.unwrap();
+        first.finish().unwrap();
+        assert!(matches!(
+            registry.take_completed(&tokens),
+            Err(UploadError::Incomplete)
+        ));
+
+        registry
+            .begin(&tokens[1], Some(0))
+            .await
+            .unwrap()
+            .finish()
+            .unwrap();
+        assert_eq!(registry.take_completed(&tokens).unwrap().len(), 2);
     }
 
     #[tokio::test]

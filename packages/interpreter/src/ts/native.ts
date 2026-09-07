@@ -588,7 +588,9 @@ export class NativeInterpreter extends JSChannel_ {
       for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
         await this.ipc.uploadFile(credentials[fileIndex], files[fileIndex]);
       }
-      this.sendIpcMessage("file_upload_complete");
+      // An HTTP success can come from an app's fallback route. Wait for LiveView to
+      // confirm it received the files before allowing the next event to start.
+      await this.ipc.completeFileUpload();
     } catch (error) {
       if (uploadStarted) {
         try {

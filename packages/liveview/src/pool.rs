@@ -270,7 +270,11 @@ impl LiveViewPool {
 ///
 /// For example, the axum implementation is a really small transform:
 ///
-/// ```rust, ignore
+/// ```rust
+/// use axum::extract::ws::{Message, WebSocket};
+/// use dioxus_liveview::{LiveViewError, LiveViewSocket};
+/// use futures_util::{SinkExt, StreamExt};
+///
 /// pub fn axum_socket(ws: WebSocket) -> impl LiveViewSocket {
 ///     ws.map(transform_rx)
 ///         .with(transform_tx)
@@ -413,13 +417,19 @@ async fn run_with_uploads(
                                     pending_file_upload = None;
                                 }
                                 IpcMessage::FileUploadComplete(_) => {
-                                    let upload = pending_file_upload.take().ok_or_else(|| {
-                                        file_upload_failed(
-                                            "received file upload completion without a pending upload",
-                                        )
-                                    })?;
-                                    let (event, files) = upload.finish().map_err(file_upload_failed)?;
-                                    dispatch_event(&vdom, &query_engine, event, files);
+                                    let result = pending_file_upload.take().ok_or_else(|| {
+                                        "received file upload completion without a pending upload".to_string()
+                                    }).and_then(PendingFileUpload::finish);
+                                    let response = match result {
+                                        Ok((event, files)) => {
+                                            dispatch_event(&vdom, &query_engine, event, files);
+                                            ClientUpdate::FileUploadComplete
+                                        }
+                                        Err(error) => ClientUpdate::FileUploadError(error),
+                                    };
+                                    ws.send(text_frame(
+                                        &serde_json::to_string(&response).unwrap(),
+                                    )).await?;
                                 }
                                 IpcMessage::Query(result) => {
                                     query_engine.send(result);
@@ -489,6 +499,8 @@ enum ClientUpdate {
     Query(String),
     #[serde(rename = "file_upload")]
     FileUpload(Vec<String>),
+    #[serde(rename = "file_upload_complete")]
+    FileUploadComplete,
     #[serde(rename = "file_upload_error")]
     FileUploadError(String),
 }

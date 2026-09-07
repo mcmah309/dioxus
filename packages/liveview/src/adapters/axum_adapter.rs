@@ -85,6 +85,7 @@ fn upload_response_error(error: crate::upload::UploadError) -> (StatusCode, Stri
         crate::upload::UploadError::FileCountLimitExceeded => StatusCode::PAYLOAD_TOO_LARGE,
         crate::upload::UploadError::BodyReadFailed => StatusCode::BAD_REQUEST,
         crate::upload::UploadError::SizeMismatch => StatusCode::BAD_REQUEST,
+        crate::upload::UploadError::Incomplete => StatusCode::CONFLICT,
     };
     (status, error.to_string())
 }
