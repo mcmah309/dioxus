@@ -489,7 +489,8 @@ export type SerializedFileData = {
   size?: number;
   last_modified?: number;
   content_type?: string;
-  contents?: string; // base64 encoded, if present. not required to br present
+  // Optional file bytes
+  contents?: number[];
 };
 
 export function extractSerializedFormValues(event: Event, target: HTMLElement): SerializedFormData {

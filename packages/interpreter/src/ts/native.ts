@@ -4,7 +4,7 @@
 // provide since it doesn't have access to the dom.
 
 import { BaseInterpreter, NodeId } from "./core";
-import { SerializedEvent, serializeEvent, SerializedFileData, extractSerializedFormValues, SerializedFormObject } from "./serialize";
+import { serializeEvent, SerializedFormObject } from "./serialize";
 
 // okay so, we've got this JSChannel thing from sledgehammer, implicitly imported into our scope
 // we want to extend it, and it technically extends base interpreter. To make typescript happy,
@@ -30,6 +30,7 @@ export class NativeInterpreter extends JSChannel_ {
   // eventually we want to remove liveview and build it into the server-side-events of fullstack
   // however, for now we need to support it since WebSockets in fullstack doesn't exist yet
   liveview: boolean;
+  private liveviewEventQueue: Promise<void> = Promise.resolve();
 
   constructor(baseUri: string, headless: boolean) {
     super();
@@ -71,8 +72,12 @@ export class NativeInterpreter extends JSChannel_ {
       false
     );
 
-    // attach a listener to the route that listens for clicks and prevents the default file dialog
+    // Desktop needs a native dialog to get filesystem paths.
     window.addEventListener("click", (event) => {
+      if (this.liveview) {
+        return;
+      }
+
       const target = event.target;
       if (
         target instanceof HTMLInputElement &&
@@ -339,16 +344,31 @@ export class NativeInterpreter extends JSChannel_ {
       bubbles,
     };
 
-    // liveview does not have synchronous event handling, so we need to send the event to the host
-    if (
-      this.liveview &&
-      target instanceof HTMLInputElement &&
-      (event.type === "change" || event.type === "input")
-    ) {
-      if (target.getAttribute("type") === "file") {
-        this.readFiles(target, contents, bubbles, element, name);
-        return;
+    if (this.liveview) {
+      // Don't re-upload files when other form fields change.
+      const uploadFiles = target instanceof HTMLElement &&
+        (name === "submit" ||
+          (target instanceof HTMLInputElement && target.type === "file" &&
+            (name === "input" || name === "change")));
+      const entries = uploadFiles ? this.snapshotFormEntries(target) : undefined;
+
+      // Preserve unselected file fields as File(None).
+      if (contents.values) {
+        contents.values = contents.values.map((value) =>
+          value.file?.path === "" && value.file.size === 0
+            ? { key: value.key }
+            : value
+        );
       }
+
+      // Send events in order, even when a file read is slow.
+      this.liveviewEventQueue = this.liveviewEventQueue.then(async () => {
+        if (entries) contents.values = await this.readFiles(entries);
+        this.sendSerializedEvent(body);
+      }).catch((error) => {
+        console.error("Failed to send LiveView event", error);
+      });
+      return;
     }
 
     const response = this.sendSerializedEvent(body);
@@ -496,35 +516,43 @@ export class NativeInterpreter extends JSChannel_ {
     }
   }
 
-  //  A liveview only function
-  // Desktop will intercept the event before it hits this
-  async readFiles(
-    target: HTMLInputElement,
-    contents: SerializedEvent,
-    bubbles: boolean,
-    realId: NodeId,
-    name: string
-  ) {
-    let files = target.files!;
-    let file_contents: { [name: string]: number[] } = {};
-
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      file_contents[file.name] = Array.from(
-        new Uint8Array(await file.arrayBuffer())
-      );
+  private snapshotFormEntries(target: HTMLElement): [string, FormDataEntryValue][] {
+    const form = target instanceof HTMLInputElement
+      ? target.form
+      : target.closest("form");
+    const entries = form ? Array.from(new FormData(form).entries()) : [];
+    if (target instanceof HTMLInputElement && (!form || !target.name)) {
+      const files = Array.from(target.files || []);
+      for (const file of files) {
+        entries.push([target.name, file]);
+      }
+      if (files.length === 0 && target.name) {
+        entries.push([target.name, new File([], "")]);
+      }
     }
+    return entries;
+  }
 
-    contents.files = { files: file_contents };
-
-    const message = this.sendSerializedEvent({
-      name: name,
-      element: realId,
-      data: contents,
-      bubbles,
-    });
-
-    this.ipc.postMessage(message);
+  private async readFiles(entries: [string, FormDataEntryValue][]): Promise<SerializedFormObject[]> {
+    return Promise.all(
+      entries.map(async ([key, value]): Promise<SerializedFormObject> => {
+        if (value instanceof File) {
+          // FormData represents an unselected file input with an empty File.
+          if (value.name === "" && value.size === 0) return { key };
+          return {
+            key,
+            file: {
+              path: value.webkitRelativePath || value.name,
+              size: value.size,
+              last_modified: value.lastModified,
+              content_type: value.type,
+              contents: Array.from(new Uint8Array(await value.arrayBuffer())),
+            },
+          };
+        }
+        return { key, text: value };
+      })
+    );
   }
 }
 

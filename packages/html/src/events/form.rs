@@ -289,9 +289,12 @@ mod serialize {
                 .map(|v| {
                     let value = if let Some(text) = &v.text {
                         FormValue::Text(text.clone())
-                    } else if let Some(_file) = &v.file {
-                        // todo: we lose the file contents here
-                        FormValue::File(None)
+                    } else if let Some(file) = v
+                        .file
+                        .as_ref()
+                        .filter(|file| !file.path.as_os_str().is_empty())
+                    {
+                        FormValue::File(Some(FileData::new(file.clone())))
                     } else {
                         FormValue::File(None)
                     };
@@ -331,5 +334,74 @@ mod serialize {
                 inner: Box::new(data),
             })
         }
+    }
+}
+
+#[cfg(all(test, feature = "serialize"))]
+mod tests {
+    use super::*;
+    use futures_util::FutureExt;
+
+    #[test]
+    fn uploaded_files_are_readable_from_form_values() {
+        let data: FormData = serde_json::from_value(serde_json::json!({
+            "values": [
+                { "key": "description", "text": "upload" },
+                {
+                    "key": "files",
+                    "file": {
+                        "path": "hello.txt",
+                        "size": 5,
+                        "last_modified": 123,
+                        "content_type": "text/plain",
+                        "contents": [104, 101, 108, 108, 111]
+                    }
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(data.get_first("description").unwrap(), "upload");
+        let Some(FormValue::File(Some(file))) = data.get_first("files") else {
+            panic!("uploaded file missing from form values");
+        };
+        assert_eq!(file, data.files()[0]);
+        assert_eq!(file.name(), "hello.txt");
+        assert_eq!(file.size(), 5);
+        assert_eq!(file.last_modified(), 123);
+        assert_eq!(file.content_type().as_deref(), Some("text/plain"));
+        assert_eq!(file.read_string().now_or_never().unwrap().unwrap(), "hello");
+        assert_eq!(
+            file.read_bytes().now_or_never().unwrap().unwrap().as_ref(),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn empty_file_value_remains_unselected() {
+        let data = FormData::from(SerializedFormData::new(
+            String::new(),
+            vec![SerializedFormObject {
+                key: "files".to_string(),
+                text: None,
+                file: Some(crate::SerializedFileData::empty()),
+            }],
+        ));
+
+        assert_eq!(data.get_first("files"), Some(FormValue::File(None)));
+    }
+
+    #[test]
+    fn unselected_liveview_file_field_can_be_parsed() {
+        let data: FormData = serde_json::from_value(serde_json::json!({
+            "values": [{ "key": "uploads" }]
+        }))
+        .unwrap();
+
+        assert_eq!(data.get_first("uploads"), Some(FormValue::File(None)));
+        assert!(data.files().is_empty());
+        let parsed: std::collections::BTreeMap<String, crate::SerializedFileData> =
+            data.parsed_values().unwrap();
+        assert_eq!(parsed["uploads"], crate::SerializedFileData::empty());
     }
 }
