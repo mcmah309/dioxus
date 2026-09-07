@@ -33,6 +33,74 @@ Dioxus-LiveView exports some primitives to wire up an app into an existing backe
 - An adapter for transforming various socket types into the `LiveViewSocket` type
 - The glue to load the interpreter into your app
 
+## File uploads
+
+Files stream over HTTP into files in the system temporary directory. Each LiveView
+connection defaults to a 1 GiB cap across incoming and retained uploads, each batch
+is limited to 1024 files, and registered batches have five minutes to start
+uploading. Set any of these values before cloning the pool for the WebSocket and
+HTTP upload routes:
+
+```rust
+use dioxus_liveview::LiveViewPool;
+use std::time::Duration;
+
+let view = LiveViewPool::new()
+    .with_upload_limit(256 * 1024 * 1024)
+    .with_upload_file_limit(100)
+    .with_upload_timeout(Duration::from_secs(60));
+```
+
+Omitted settings keep their defaults. A file's declared size counts toward the cap
+from registration until its last `FileData` handle or reader is dropped. Dropping
+the last handle deletes the temporary file and releases its quota. Canceled and
+failed uploads also clean up their temporary files. Each connection has its own
+budget; the pool does not identify accounts across connections.
+
+The timeout releases unused upload reservations without waiting for another
+upload. Once a batch starts uploading, it remains valid until completion or
+cancellation. Files retained by the app remain available until released.
+
+`FileData::byte_stream()` reads the temporary file in bounded chunks. `read_bytes()`
+and `read_string()` load its contents into memory only when the app requests them.
+`name()` preserves the browser's filename; `path()` returns the server's temporary
+path after an upload. Metadata-only events do not expose the browser-supplied name
+as a server path. Keep a `FileData` handle alive while using a temporary path.
+
+If you construct your own `VirtualDom`, call `view.run(vdom, socket).await` on your
+local executor and pass `view.clone()` to `axum_file_upload`. Both handlers must use
+the same pool to share upload credentials and temporary files. The standalone `run` function
+is deprecated because its upload registry is inaccessible to the HTTP handler.
+
+### Cross-origin WebSocket URLs
+
+Uploads use the HTTP equivalent of the configured WebSocket URL and include the
+destination origin's credentials. If that URL is cross-origin, configure CORS on
+the upload router with the exact page origin. Credentialed CORS cannot use a
+wildcard origin. The upload request uses `PUT` with `Content-Type`,
+`Content-Disposition`, `X-Content-Size`, and `X-Request-Client` headers, so the CORS
+layer must allow that method and those headers. For example:
+
+```rust
+use axum::http::{header, HeaderName, HeaderValue, Method};
+use tower_http::cors::CorsLayer;
+
+let upload_cors = CorsLayer::new()
+    .allow_origin(HeaderValue::from_static("https://app.example.com"))
+    .allow_methods([Method::PUT])
+    .allow_headers([
+        header::CONTENT_TYPE,
+        header::CONTENT_DISPOSITION,
+        HeaderName::from_static("x-content-size"),
+        HeaderName::from_static("x-request-client"),
+    ])
+    .allow_credentials(true);
+
+let upload_router = axum::Router::new()
+    .route("/ws/upload/{token}", dioxus_liveview::axum_file_upload(view))
+    .layer(upload_cors);
+```
+
 ## Contributing
 
 - Report issues on our [issue tracker](https://github.com/dioxuslabs/dioxus/issues).

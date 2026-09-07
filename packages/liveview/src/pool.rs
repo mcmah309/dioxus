@@ -6,17 +6,159 @@ use crate::{
     query::{QueryEngine, QueryResult},
 };
 
+use crate::{
+    file_data::LiveviewFormData,
+    upload::{StoredFile, UploadSession},
+};
 use dioxus_core::{Element, Event, ScopeId, VirtualDom, provide_context};
 use dioxus_html::{EventData, HtmlEvent, PlatformEventData};
 use dioxus_interpreter_js::MutationState;
 use futures_util::{SinkExt, StreamExt, pin_mut};
-use serde::Serialize;
-use std::{any::Any, rc::Rc};
+use serde::{Deserialize, Serialize};
+use std::{any::Any, rc::Rc, sync::Arc};
 use tokio_util::task::LocalPoolHandle;
+
+#[derive(Deserialize, Debug)]
+struct FileUploadStart {
+    size: u64,
+    event: Box<HtmlEvent>,
+}
+
+#[derive(Deserialize, Debug)]
+struct FileUploadCancel {}
+
+#[derive(Deserialize, Debug)]
+struct FileUploadComplete {}
+
+#[derive(Deserialize, Debug)]
+#[serde(tag = "method", content = "params")]
+enum IpcMessage {
+    #[serde(rename = "user_event")]
+    Event(Box<HtmlEvent>),
+    // Validate upload metadata in the handler so malformed requests receive an error response.
+    #[serde(rename = "file_upload")]
+    FileUpload(serde_json::Value),
+    #[serde(rename = "file_upload_cancel")]
+    FileUploadCancel(FileUploadCancel),
+    #[serde(rename = "file_upload_complete")]
+    FileUploadComplete(FileUploadComplete),
+    #[serde(rename = "query")]
+    Query(QueryResult),
+}
+
+struct PendingFileUpload {
+    event: Option<Box<HtmlEvent>>,
+    file_count: usize,
+    tokens: Vec<String>,
+    uploads: crate::upload::FileUploadRegistry,
+}
+
+impl PendingFileUpload {
+    fn new(
+        upload: FileUploadStart,
+        uploads: crate::upload::FileUploadRegistry,
+        session: &UploadSession,
+    ) -> Result<Self, String> {
+        let EventData::Form(form) = &upload.event.data else {
+            return Err("file upload did not contain a form event".to_string());
+        };
+        let mut size = 0_u64;
+        let mut sizes = Vec::new();
+        for value in &form.values {
+            let Some(file) = value.file.as_ref() else {
+                continue;
+            };
+            size = size
+                .checked_add(file.size)
+                .ok_or_else(|| "file upload size overflowed".to_string())?;
+            sizes.push(file.size);
+        }
+        if sizes.is_empty() {
+            return Err("file upload did not contain any files".to_string());
+        }
+        if size != upload.size {
+            return Err("file upload size did not match its file metadata".to_string());
+        }
+        let tokens = uploads
+            .register(session, &sizes)
+            .map_err(|error| error.to_string())?;
+
+        Ok(Self {
+            event: Some(upload.event),
+            file_count: sizes.len(),
+            tokens,
+            uploads,
+        })
+    }
+
+    fn credentials(&self) -> Vec<String> {
+        self.tokens.clone()
+    }
+
+    fn cancel(&mut self) {
+        self.uploads.cancel(&self.tokens);
+        self.tokens.clear();
+    }
+
+    fn finish(mut self) -> Result<(Box<HtmlEvent>, Vec<Arc<StoredFile>>), String> {
+        let files = self
+            .uploads
+            .take_completed(&self.tokens)
+            .map_err(|error| error.to_string())?;
+        self.tokens.clear();
+        if files.len() != self.file_count {
+            return Err("file upload response did not contain every file".to_string());
+        }
+        Ok((self.event.take().unwrap(), files))
+    }
+}
+
+impl Drop for PendingFileUpload {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+fn file_upload_failed(error: impl ToString) -> LiveViewError {
+    LiveViewError::FileUploadFailed(error.to_string())
+}
+
+fn dispatch_event(
+    vdom: &VirtualDom,
+    query_engine: &QueryEngine,
+    event: Box<HtmlEvent>,
+    files: Vec<Arc<StoredFile>>,
+) {
+    let HtmlEvent {
+        element,
+        name,
+        bubbles,
+        data,
+    } = *event;
+    // Intercept the mounted event and insert a custom element type.
+    let event = if let EventData::Mounted = &data {
+        let element = LiveviewElement::new(element, query_engine.clone());
+        Event::new(
+            Rc::new(PlatformEventData::new(Box::new(element))) as Rc<dyn Any>,
+            bubbles,
+        )
+    } else if let EventData::Form(form) = data {
+        Event::new(
+            Rc::new(PlatformEventData::new(Box::new(LiveviewFormData::new(
+                form, files,
+            )))) as Rc<dyn Any>,
+            bubbles,
+        )
+    } else {
+        Event::new(data.into_any(), bubbles)
+    };
+    vdom.runtime().handle_event(&name, event, element);
+}
 
 #[derive(Clone)]
 pub struct LiveViewPool {
     pub(crate) pool: LocalPoolHandle,
+    pub(crate) uploads: crate::upload::FileUploadRegistry,
 }
 
 impl Default for LiveViewPool {
@@ -36,7 +178,51 @@ impl LiveViewPool {
                     .map(usize::from)
                     .unwrap_or(1),
             ),
+            uploads: Default::default(),
         }
+    }
+
+    /// Set the total bytes each LiveView connection may hold in incoming and completed uploads.
+    ///
+    /// Files are streamed to temporary files. Their declared sizes count toward the limit from
+    /// registration until the last file handle or reader is dropped, including handles retained
+    /// by the application after the event. Defaults to [`crate::DEFAULT_UPLOAD_LIMIT`] (1 GiB).
+    pub fn with_upload_limit(mut self, limit: u64) -> Self {
+        self.uploads = self.uploads.with_limit(limit);
+        self
+    }
+
+    /// Set the maximum number of files accepted in one LiveView upload batch.
+    ///
+    /// This limit also applies to zero-byte files so a batch cannot consume unbounded registry
+    /// entries or temporary-file metadata without counting toward the byte limit. Defaults to
+    /// [`crate::DEFAULT_UPLOAD_FILE_LIMIT`] (1024 files).
+    pub fn with_upload_file_limit(mut self, limit: usize) -> Self {
+        self.uploads = self.uploads.with_file_limit(limit);
+        self
+    }
+
+    /// Set how long a registered upload batch may wait for its first HTTP request.
+    ///
+    /// Unused batches release their quota reservations when this timeout expires. Once any file
+    /// starts uploading, the batch remains valid until completion or cancellation by the websocket.
+    /// Defaults to [`crate::DEFAULT_UPLOAD_TIMEOUT`] (five minutes).
+    pub fn with_upload_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.uploads = self.uploads.with_timeout(timeout);
+        self
+    }
+
+    /// Run an existing VirtualDom on the caller's executor using this pool's upload registry.
+    ///
+    /// Pass a clone of this pool to the HTTP upload handler so it can receive files for this
+    /// connection. The returned future is not `Send`; await it on a local executor. Use
+    /// [`Self::launch_virtualdom`] to create and run a VirtualDom on the pool's threads instead.
+    pub async fn run(
+        &self,
+        vdom: VirtualDom,
+        ws: impl LiveViewSocket,
+    ) -> Result<(), LiveViewError> {
+        run_with_uploads(vdom, ws, self.uploads.clone()).await
     }
 
     pub async fn launch(
@@ -62,7 +248,12 @@ impl LiveViewPool {
         ws: impl LiveViewSocket,
         make_app: F,
     ) -> Result<(), LiveViewError> {
-        match self.pool.spawn_pinned(move || run(make_app(), ws)).await {
+        let uploads = self.uploads.clone();
+        match self
+            .pool
+            .spawn_pinned(move || run_with_uploads(make_app(), ws, uploads))
+            .await
+        {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(LiveViewError::SendingFailed),
@@ -70,7 +261,7 @@ impl LiveViewPool {
     }
 }
 
-/// A LiveViewSocket is a Sink and Stream of Strings that Dioxus uses to communicate with the client
+/// A LiveViewSocket is a Sink and Stream of bytes that Dioxus uses to communicate with the client.
 ///
 /// Most websockets from most HTTP frameworks can be converted into a LiveViewSocket using the appropriate adapter.
 ///
@@ -86,15 +277,16 @@ impl LiveViewPool {
 ///         .sink_map_err(|_| LiveViewError::SendingFailed)
 /// }
 ///
-/// fn transform_rx(message: Result<Message, axum::Error>) -> Result<String, LiveViewError> {
+/// fn transform_rx(message: Result<Message, axum::Error>) -> Result<Vec<u8>, LiveViewError> {
 ///     message
 ///         .map_err(|_| LiveViewError::SendingFailed)?
 ///         .into_text()
+///         .map(|text| text.as_str().into())
 ///         .map_err(|_| LiveViewError::SendingFailed)
 /// }
 ///
-/// async fn transform_tx(message: String) -> Result<Message, axum::Error> {
-///     Ok(Message::Text(message))
+/// async fn transform_tx(message: Vec<u8>) -> Result<Message, axum::Error> {
+///     Ok(Message::Binary(message.into()))
 /// }
 /// ```
 pub trait LiveViewSocket:
@@ -120,7 +312,19 @@ impl<S> LiveViewSocket for S where
 /// As long as your framework can provide a Sink and Stream of Bytes, you can use this function.
 ///
 /// You might need to transform the error types of the web backend into the LiveView error type.
-pub async fn run(mut vdom: VirtualDom, ws: impl LiveViewSocket) -> Result<(), LiveViewError> {
+///
+/// For file uploads, use [`LiveViewPool::run`] with the same pool as your HTTP upload handler.
+/// This standalone function cannot share its upload registry with that handler.
+#[deprecated(note = "Use LiveViewPool::run with the same pool as the HTTP upload handler")]
+pub async fn run(vdom: VirtualDom, ws: impl LiveViewSocket) -> Result<(), LiveViewError> {
+    run_with_uploads(vdom, ws, Default::default()).await
+}
+
+async fn run_with_uploads(
+    mut vdom: VirtualDom,
+    ws: impl LiveViewSocket,
+    uploads: crate::upload::FileUploadRegistry,
+) -> Result<(), LiveViewError> {
     #[cfg(all(feature = "devtools", debug_assertions))]
     let mut hot_reload_rx = {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -149,16 +353,8 @@ pub async fn run(mut vdom: VirtualDom, ws: impl LiveViewSocket) -> Result<(), Li
         ws.send(edits).await?;
     }
 
-    // desktop uses this wrapper struct thing around the actual event itself
-    // this is sorta driven by tao/wry
-    #[derive(serde::Deserialize, Debug)]
-    #[serde(tag = "method", content = "params")]
-    enum IpcMessage {
-        #[serde(rename = "user_event")]
-        Event(Box<HtmlEvent>),
-        #[serde(rename = "query")]
-        Query(QueryResult),
-    }
+    let upload_session = uploads.new_session();
+    let mut pending_file_upload: Option<PendingFileUpload> = None;
 
     loop {
         #[cfg(all(feature = "devtools", debug_assertions))]
@@ -170,6 +366,15 @@ pub async fn run(mut vdom: VirtualDom, ws: impl LiveViewSocket) -> Result<(), Li
             // poll any futures or suspense
             _ = vdom.wait_for_work() => {}
 
+            _ = async {
+                match &pending_file_upload {
+                    Some(upload) => uploads.wait_for_cleanup(&upload.tokens).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                pending_file_upload = None;
+            }
+
             evt = ws.next() => {
                 match evt.as_ref().map(|o| o.as_deref()) {
                     // respond with a pong every ping to keep the websocket alive
@@ -180,24 +385,41 @@ pub async fn run(mut vdom: VirtualDom, ws: impl LiveViewSocket) -> Result<(), Li
                         if let Ok(message) = serde_json::from_str::<IpcMessage>(&String::from_utf8_lossy(evt)) {
                             match message {
                                 IpcMessage::Event(evt) => {
-                                    // Intercept the mounted event and insert a custom element type
-                                    let event = if let EventData::Mounted = &evt.data {
-                                        let element = LiveviewElement::new(evt.element, query_engine.clone());
-                                        Event::new(
-                                            Rc::new(PlatformEventData::new(Box::new(element))) as Rc<dyn Any>,
-                                            evt.bubbles,
-                                        )
-                                    } else {
-                                        Event::new(
-                                            evt.data.into_any(),
-                                            evt.bubbles,
-                                        )
+                                    dispatch_event(&vdom, &query_engine, evt, Vec::new());
+                                }
+                                IpcMessage::FileUpload(upload) => {
+                                    if pending_file_upload.is_some() {
+                                        return Err(file_upload_failed(
+                                            "received a new file upload before the previous upload completed",
+                                        ));
+                                    }
+                                    let upload = serde_json::from_value::<FileUploadStart>(upload)
+                                        .map_err(|error| format!("invalid file upload metadata: {error}"))
+                                        .and_then(|upload| PendingFileUpload::new(upload, uploads.clone(), &upload_session));
+                                    let response = match upload {
+                                        Ok(upload) => {
+                                            let credentials = upload.credentials();
+                                            pending_file_upload = Some(upload);
+                                            ClientUpdate::FileUpload(credentials)
+                                        }
+                                        Err(error) => ClientUpdate::FileUploadError(error),
                                     };
-                                    vdom.runtime().handle_event(
-                                        &evt.name,
-                                        event,
-                                        evt.element,
-                                    );
+                                    ws.send(text_frame(
+                                        &serde_json::to_string(&response).unwrap(),
+                                    ))
+                                    .await?;
+                                }
+                                IpcMessage::FileUploadCancel(_) => {
+                                    pending_file_upload = None;
+                                }
+                                IpcMessage::FileUploadComplete(_) => {
+                                    let upload = pending_file_upload.take().ok_or_else(|| {
+                                        file_upload_failed(
+                                            "received file upload completion without a pending upload",
+                                        )
+                                    })?;
+                                    let (event, files) = upload.finish().map_err(file_upload_failed)?;
+                                    dispatch_event(&vdom, &query_engine, event, files);
                                 }
                                 IpcMessage::Query(result) => {
                                     query_engine.send(result);
@@ -265,4 +487,122 @@ fn take_edits(mutations: &mut MutationState) -> Option<Vec<u8>> {
 enum ClientUpdate {
     #[serde(rename = "query")]
     Query(String),
+    #[serde(rename = "file_upload")]
+    FileUpload(Vec<String>),
+    #[serde(rename = "file_upload_error")]
+    FileUploadError(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending_upload(uploads: crate::upload::FileUploadRegistry) -> PendingFileUpload {
+        let message: IpcMessage = serde_json::from_value(serde_json::json!({
+            "method": "file_upload",
+            "params": {
+                "size": 3,
+                "event": {
+                    "element": 0,
+                    "name": "change",
+                    "bubbles": true,
+                    "data": {
+                        "values": [
+                            { "key": "description", "text": "upload" },
+                            {
+                                "key": "files",
+                                "file": {
+                                    "path": "hello.bin",
+                                    "size": 3,
+                                    "last_modified": 123,
+                                    "content_type": "application/octet-stream"
+                                }
+                            },
+                            {
+                                "key": "files",
+                                "file": {
+                                    "path": "empty.bin",
+                                    "size": 0,
+                                    "last_modified": 456,
+                                    "content_type": "application/octet-stream"
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let IpcMessage::FileUpload(upload) = message else {
+            unreachable!()
+        };
+        PendingFileUpload::new(
+            serde_json::from_value(upload).unwrap(),
+            uploads.clone(),
+            &uploads.new_session(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn http_uploads_are_attached_to_the_form_event() {
+        let uploads = crate::upload::FileUploadRegistry::default();
+        let upload = pending_upload(uploads.clone());
+        let credentials = upload.credentials();
+        let mut file = uploads.begin(&credentials[0], Some(3)).await.unwrap();
+        file.write(bytes::Bytes::from_static(&[0, 255, 128]))
+            .await
+            .unwrap();
+        file.finish().unwrap();
+        uploads
+            .begin(&credentials[1], Some(0))
+            .await
+            .unwrap()
+            .finish()
+            .unwrap();
+
+        let (event, files) = upload.finish().unwrap();
+        let EventData::Form(form) = event.data else {
+            unreachable!()
+        };
+        let form = dioxus_html::FormData::new(LiveviewFormData::new(form, files));
+        assert_eq!(form.get_first("description").unwrap(), "upload");
+        let files = form.files();
+        assert_eq!(files[0].name(), "hello.bin");
+        assert_eq!(files[0].size(), 3);
+        assert_eq!(files[0].last_modified(), 123);
+        assert_eq!(
+            files[0].content_type().as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            files[0].read_bytes().await.unwrap().as_ref(),
+            &[0, 255, 128]
+        );
+        assert!(files[1].read_bytes().await.unwrap().is_empty());
+        assert_eq!(files[1].name(), "empty.bin");
+        assert!(files[0].path().is_file());
+        let paths: Vec<_> = files.iter().map(|file| file.path()).collect();
+        drop(form);
+        assert!(paths.iter().all(|path| path.exists()));
+        drop(files);
+        assert!(paths.iter().all(|path| !path.exists()));
+    }
+
+    #[test]
+    fn upload_size_must_match_the_file_metadata() {
+        let uploads = crate::upload::FileUploadRegistry::default();
+        let mut pending = pending_upload(uploads);
+        let mut upload = pending.event.take().unwrap();
+        let EventData::Form(form) = &mut upload.data else {
+            unreachable!()
+        };
+        form.values[1].file.as_mut().unwrap().size = 4;
+        let upload = FileUploadStart {
+            size: 3,
+            event: upload,
+        };
+        let uploads = crate::upload::FileUploadRegistry::default();
+        assert!(PendingFileUpload::new(upload, uploads.clone(), &uploads.new_session()).is_err());
+    }
 }

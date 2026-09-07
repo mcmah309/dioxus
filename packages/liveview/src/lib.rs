@@ -9,14 +9,26 @@ pub use adapters::*;
 mod element;
 pub mod pool;
 mod query;
+mod upload;
 use dioxus_interpreter_js::NATIVE_JS;
 use futures_util::{SinkExt, StreamExt};
 pub use pool::*;
 mod config;
 mod document;
 mod events;
+mod file_data;
 mod history;
 pub use config::*;
+
+/// The default cap on incoming and retained temporary-file data per LiveView connection.
+pub const DEFAULT_UPLOAD_LIMIT: u64 = 1024 * 1024 * 1024;
+
+/// The default number of files allowed in a single LiveView upload batch.
+pub const DEFAULT_UPLOAD_FILE_LIMIT: usize = 1024;
+
+/// How long a registered upload batch may wait for its first HTTP request by default.
+pub const DEFAULT_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 #[cfg(feature = "axum")]
 pub mod launch;
 
@@ -31,6 +43,8 @@ impl<T> WebsocketRx for T where T: StreamExt<Item = Result<String, LiveViewError
 pub enum LiveViewError {
     #[error("Sending to client error")]
     SendingFailed,
+    #[error("LiveView file upload failed: {0}")]
+    FileUploadFailed(String),
 }
 
 fn handle_edits_code() -> String {

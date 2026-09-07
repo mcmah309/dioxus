@@ -3840,11 +3840,13 @@ name = "dioxus-liveview"
 version = "0.8.0-alpha.1"
 dependencies = [
  "axum 0.8.9",
+ "bytes",
  "dioxus",
  "dioxus-cli-config",
  "dioxus-core",
  "dioxus-devtools",
  "dioxus-document",
+ "dioxus-fullstack",
  "dioxus-history",
  "dioxus-html",
  "dioxus-interpreter-js",
@@ -3855,12 +3857,14 @@ dependencies = [
  "serde",
  "serde_json",
  "slab",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-util",
  "tower 0.5.3",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -4004,7 +4008,9 @@ dependencies = [
  "axum 0.8.9",
  "dioxus",
  "dioxus-liveview",
+ "futures-util",
  "tokio",
+ "tower-http",
 ]
 
 [[package]]

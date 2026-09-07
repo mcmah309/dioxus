@@ -363,8 +363,11 @@ export class NativeInterpreter extends JSChannel_ {
 
       // Send events in order, even when a file read is slow.
       this.liveviewEventQueue = this.liveviewEventQueue.then(async () => {
-        if (entries) contents.values = await this.readFiles(entries);
-        this.sendSerializedEvent(body);
+        if (entries) {
+          await this.sendLiveviewFileEvent(body, entries);
+        } else {
+          this.sendSerializedEvent(body);
+        }
       }).catch((error) => {
         console.error("Failed to send LiveView event", error);
       });
@@ -533,26 +536,69 @@ export class NativeInterpreter extends JSChannel_ {
     return entries;
   }
 
-  private async readFiles(entries: [string, FormDataEntryValue][]): Promise<SerializedFormObject[]> {
-    return Promise.all(
-      entries.map(async ([key, value]): Promise<SerializedFormObject> => {
-        if (value instanceof File) {
-          // FormData represents an unselected file input with an empty File.
-          if (value.name === "" && value.size === 0) return { key };
-          return {
-            key,
-            file: {
-              path: value.webkitRelativePath || value.name,
-              size: value.size,
-              last_modified: value.lastModified,
-              content_type: value.type,
-              contents: Array.from(new Uint8Array(await value.arrayBuffer())),
-            },
-          };
+  private async sendLiveviewFileEvent(
+    body: { name: string; element: number; data: any; bubbles: boolean },
+    entries: [string, FormDataEntryValue][]
+  ): Promise<void> {
+    const values: SerializedFormObject[] = [];
+    const files: File[] = [];
+
+    for (const [key, value] of entries) {
+      if (!(value instanceof File)) {
+        values.push({ key, text: value });
+        continue;
+      }
+
+      // FormData represents an unselected file input with an empty File.
+      if (value.name === "" && value.size === 0) {
+        values.push({ key });
+        continue;
+      }
+
+      values.push({
+        key,
+        file: {
+          path: value.webkitRelativePath || value.name,
+          size: value.size,
+          last_modified: value.lastModified,
+          content_type: value.type,
+        },
+      });
+      files.push(value);
+    }
+
+    body.data.values = values;
+    if (files.length === 0) {
+      this.sendSerializedEvent(body);
+      return;
+    }
+
+    const size = files.reduce((total, file) => total + file.size, 0);
+    if (!Number.isSafeInteger(size)) {
+      throw new Error("LiveView file upload size exceeds JavaScript's safe integer range");
+    }
+
+    let uploadStarted = false;
+    try {
+      const credentials = await this.ipc.beginFileUpload({ size, event: body });
+      uploadStarted = true;
+      if (!Array.isArray(credentials) || credentials.length !== files.length) {
+        throw new Error("LiveView returned invalid file upload credentials");
+      }
+      for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
+        await this.ipc.uploadFile(credentials[fileIndex], files[fileIndex]);
+      }
+      this.sendIpcMessage("file_upload_complete");
+    } catch (error) {
+      if (uploadStarted) {
+        try {
+          this.sendIpcMessage("file_upload_cancel");
+        } catch {
+          // The websocket may be the reason the upload failed.
         }
-        return { key, text: value };
-      })
-    );
+      }
+      throw error;
+    }
   }
 }
 

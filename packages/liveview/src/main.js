@@ -29,6 +29,15 @@ class IPC {
       // todo: retry the connection
     };
 
+    ws.onclose = () => {
+      if (this.pendingFileUpload) {
+        this.pendingFileUpload.reject(
+          new Error("LiveView websocket closed while creating a file upload")
+        );
+        this.pendingFileUpload = null;
+      }
+    };
+
     ws.onmessage = (message) => {
       const u8view = new Uint8Array(message.data);
       const binaryFrame = u8view[0] == 1;
@@ -50,16 +59,70 @@ class IPC {
             case "query":
               Function("Eval", `"use strict";${event.data};`)();
               break;
+            case "file_upload":
+            case "file_upload_error":
+              if (!this.pendingFileUpload) {
+                throw new Error("Received an unexpected LiveView file upload response");
+              }
+              if (event.type === "file_upload_error") {
+                this.pendingFileUpload.reject(new Error(event.data));
+              } else {
+                this.pendingFileUpload.resolve(event.data);
+              }
+              this.pendingFileUpload = null;
+              break;
           }
         }
       }
     };
 
     this.ws = ws;
+    this.pendingFileUpload = null;
   }
 
   postMessage(msg) {
     this.ws.send(msg);
+  }
+
+  beginFileUpload(params) {
+    if (this.pendingFileUpload) {
+      return Promise.reject(new Error("A LiveView file upload is already pending"));
+    }
+    if (this.ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("LiveView websocket is not open"));
+    }
+    return new Promise((resolve, reject) => {
+      this.pendingFileUpload = { resolve, reject };
+      try {
+        this.ws.send(JSON.stringify({ method: "file_upload", params }));
+      } catch (error) {
+        this.pendingFileUpload = null;
+        reject(error);
+      }
+    });
+  }
+
+  async uploadFile(token, file) {
+    const url = new URL(this.ws.url);
+    url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+    url.pathname = `${url.pathname.replace(/\/$/, "")}/upload/${encodeURIComponent(token)}`;
+    url.hash = "";
+    const contentLength = file.size.toString();
+    const response = await fetch(url, {
+      method: "PUT",
+      credentials: "include",
+      headers: {
+        "Content-Type": file.type,
+        "Content-Length": contentLength,
+        "X-Content-Size": contentLength,
+        "Content-Disposition": `attachment; filename="${escape(file.name)}"`,
+        "X-Request-Client": "dioxus",
+      },
+      body: file,
+    });
+    if (!response.ok) {
+      throw new Error(`LiveView file upload failed with status ${response.status}`);
+    }
   }
 }
 

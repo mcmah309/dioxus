@@ -1,13 +1,23 @@
 // This test is used by playwright configured in the root of the repo
 
-use axum::{Router, extract::ws::WebSocketUpgrade, response::Html, routing::get};
+use axum::{
+    Router,
+    extract::{Query, ws::WebSocketUpgrade},
+    response::Html,
+    routing::get,
+};
 use dioxus::{logger::tracing::Level, prelude::*};
+use futures_util::StreamExt;
+use std::collections::HashMap;
+use tower_http::cors::CorsLayer;
 
 fn app() -> Element {
     let mut num = use_signal(|| 0);
     let mut submitted_files = use_signal(String::new);
     let mut description_values = use_signal(Vec::<String>::new);
     let mut upload_selected = use_signal(String::new);
+    let mut large_upload = use_signal(String::new);
+    let mut retained_files = use_signal(Vec::<dioxus::html::FileData>::new);
 
     rsx! {
         div {
@@ -44,6 +54,37 @@ fn app() -> Element {
         pre { id: "submitted-files", "{submitted_files}" }
         pre { id: "description-values", "{description_values.read().join(\",\")}" }
         pre { id: "upload-selected", "{upload_selected}" }
+        input {
+            id: "large-file-picker",
+            r#type: "file",
+            multiple: true,
+            onchange: move |event| async move {
+                let mut uploads = Vec::new();
+                for file in event.files() {
+                    let mut stream = file.byte_stream();
+                    let mut size = 0;
+                    let mut first = 0;
+                    let mut last = 0;
+                    while let Some(chunk) = stream.next().await {
+                        let bytes = chunk.unwrap();
+                        assert!(bytes.len() <= 64 * 1024);
+                        if size == 0 { first = bytes.first().copied().unwrap_or_default(); }
+                        last = bytes.last().copied().unwrap_or_default();
+                        size += bytes.len();
+                    }
+                    uploads.push(format!("{}|{size}|{first}|{last}", file.name()));
+                }
+                large_upload.set(uploads.join("\n"));
+            },
+        }
+        pre { id: "large-upload", "{large_upload}" }
+        input {
+            id: "retained-file-picker",
+            r#type: "file",
+            onchange: move |event| retained_files.set(event.files()),
+        }
+        pre { id: "retained-files", "{retained_files.read().len()}" }
+        button { onclick: move |_| retained_files.clear(), "Release files" }
     }
 }
 
@@ -135,10 +176,12 @@ async fn main() {
 
     let view = dioxus_liveview::LiveViewPool::new();
 
+    let websocket_view = view.clone();
     let app = Router::new()
         .route(
             "/",
-            get(move || async move {
+            get(move |Query(options): Query<HashMap<String, String>>| async move {
+                let query = if options.contains_key("direct") { "?direct=true" } else { "" };
                 Html(format!(
                     r#"
             <!DOCTYPE html>
@@ -148,17 +191,42 @@ async fn main() {
                 {glue}
             </html>
             "#,
-                    glue = dioxus_liveview::interpreter_glue(&format!("ws://{addr}/ws"))
+                    glue = dioxus_liveview::interpreter_glue(&format!("ws://{addr}/ws{query}"))
                 ))
             }),
         )
         .route(
             "/ws",
-            get(move |ws: WebSocketUpgrade| async move {
+            get(move |ws: WebSocketUpgrade, Query(options): Query<HashMap<String, String>>| async move {
+                let view = websocket_view.clone();
                 ws.on_upgrade(move |socket| async move {
-                    _ = view.launch(dioxus_liveview::axum_socket(socket), app).await;
+                    if options.contains_key("direct") {
+                        _ = tokio::task::spawn_blocking(move || {
+                            tokio::runtime::Handle::current().block_on(async move {
+                                _ = view.run(VirtualDom::new(app), dioxus_liveview::axum_socket(socket)).await;
+                            });
+                        }).await;
+                    } else {
+                        _ = view.launch(dioxus_liveview::axum_socket(socket), app).await;
+                    }
                 })
             }),
+        )
+        .route(
+            "/ws/upload/{token}",
+            dioxus_liveview::axum_file_upload(view),
+        )
+        .layer(
+            CorsLayer::new()
+                .allow_origin("http://localhost:3030".parse::<axum::http::HeaderValue>().unwrap())
+                .allow_methods([axum::http::Method::PUT])
+                .allow_headers([
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::header::CONTENT_DISPOSITION,
+                    axum::http::HeaderName::from_static("x-content-size"),
+                    axum::http::HeaderName::from_static("x-request-client"),
+                ])
+                .allow_credentials(true),
         );
 
     println!("Listening on http://{addr}");
