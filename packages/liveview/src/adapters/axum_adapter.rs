@@ -3,16 +3,14 @@ use std::sync::Arc;
 use crate::{LiveViewError, LiveViewPool, LiveViewSocket, LiveviewRouter, interpreter_glue};
 use axum::{
     Router,
-    extract::Path,
     extract::{
-        WebSocketUpgrade,
+        Path, Request, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::StatusCode,
     response::Html,
     routing::*,
 };
-use dioxus_fullstack::FileStream;
 use futures_util::{SinkExt, StreamExt};
 
 /// Convert an Axum WebSocket into a `LiveViewSocket`.
@@ -47,21 +45,27 @@ async fn transform_tx(message: Vec<u8>) -> Result<Message, axum::Error> {
 /// the page's exact origin, credentials, `PUT`, and the upload headers. See the crate README's
 /// "Cross-origin WebSocket URLs" section for a complete example.
 pub fn axum_file_upload(view: LiveViewPool) -> MethodRouter {
-    put(move |Path(token): Path<String>, mut file: FileStream| {
+    put(move |Path(token): Path<String>, request: Request| {
         let view = view.clone();
         async move {
+            let size = request
+                .headers()
+                .get("X-Content-Size")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
             let mut upload = view
                 .uploads
-                .begin(&token, file.size())
+                .begin(&token, size)
                 .await
                 .map_err(upload_response_error)?;
+            let mut body = request.into_body().into_data_stream();
             loop {
                 let chunk = tokio::select! {
                     biased;
                     _ = upload.cancelled() => {
                         return Err(upload_response_error(crate::upload::UploadError::Canceled));
                     }
-                    chunk = file.next() => chunk,
+                    chunk = body.next() => chunk,
                 };
                 let Some(chunk) = chunk else { break };
                 let chunk = chunk.map_err(|_| {

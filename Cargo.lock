@@ -3846,7 +3846,6 @@ dependencies = [
  "dioxus-core",
  "dioxus-devtools",
  "dioxus-document",
- "dioxus-fullstack",
  "dioxus-history",
  "dioxus-html",
  "dioxus-interpreter-js",
