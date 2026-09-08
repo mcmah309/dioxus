@@ -108,14 +108,13 @@ pub use serialize::*;
 mod serialize {
     use super::*;
 
-    /// A serializable representation of file data
+    /// A serializable representation of file metadata
     #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Clone)]
     pub struct SerializedFileData {
         pub path: PathBuf,
         pub size: u64,
         pub last_modified: u64,
         pub content_type: Option<String>,
-        pub contents: Option<bytes::Bytes>,
     }
 
     impl SerializedFileData {
@@ -126,7 +125,6 @@ mod serialize {
                 size: 0,
                 last_modified: 0,
                 content_type: None,
-                contents: None,
             }
         }
 
@@ -137,7 +135,6 @@ mod serialize {
                 size: file_data.size(),
                 last_modified: file_data.last_modified(),
                 content_type: file_data.content_type(),
-                contents: None,
             }
         }
     }
@@ -163,14 +160,9 @@ mod serialize {
             &self,
         ) -> Pin<Box<dyn Future<Output = Result<Bytes, dioxus_core::CapturedError>> + 'static>>
         {
-            let contents = self.contents.clone();
             let path = self.path.clone();
 
             Box::pin(async move {
-                if let Some(contents) = contents {
-                    return Ok(contents);
-                }
-
                 #[cfg(not(target_arch = "wasm32"))]
                 if path.exists() {
                     return Ok(std::fs::read(path).map(Bytes::from)?);
@@ -186,14 +178,9 @@ mod serialize {
             &self,
         ) -> Pin<Box<dyn Future<Output = Result<String, dioxus_core::CapturedError>> + 'static>>
         {
-            let contents = self.contents.clone();
             let path = self.path.clone();
 
             Box::pin(async move {
-                if let Some(contents) = contents {
-                    return Ok(String::from_utf8(contents.to_vec())?);
-                }
-
                 #[cfg(not(target_arch = "wasm32"))]
                 if path.exists() {
                     return Ok(std::fs::read_to_string(path)?);
@@ -214,14 +201,9 @@ mod serialize {
                     + Send,
             >,
         > {
-            let contents = self.contents.clone();
             let path = self.path.clone();
 
             Box::pin(futures_util::stream::once(async move {
-                if let Some(contents) = contents {
-                    return Ok(contents);
-                }
-
                 #[cfg(not(target_arch = "wasm32"))]
                 if path.exists() {
                     return Ok(std::fs::read(path).map(Bytes::from)?);

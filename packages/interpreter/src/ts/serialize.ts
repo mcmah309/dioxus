@@ -380,7 +380,6 @@ function serializeDataTransfer(data_transfer: DataTransfer): SerializedEvent {
       size: file.size,
       last_modified: file.lastModified,
       content_type: file.type,
-      contents: undefined, // we don't serialize contents here
     });
   }
 
@@ -489,8 +488,6 @@ export type SerializedFileData = {
   size?: number;
   last_modified?: number;
   content_type?: string;
-  // Optional file bytes
-  contents?: number[];
 };
 
 export function extractSerializedFormValues(event: Event, target: HTMLElement): SerializedFormData {

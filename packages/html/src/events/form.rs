@@ -340,21 +340,24 @@ mod serialize {
 #[cfg(all(test, feature = "serialize"))]
 mod tests {
     use super::*;
-    use futures_util::FutureExt;
 
     #[test]
-    fn uploaded_files_are_readable_from_form_values() {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn files_are_readable_from_serialized_paths() {
+        use futures_util::FutureExt;
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let contents = include_str!("../../Cargo.toml");
         let data: FormData = serde_json::from_value(serde_json::json!({
             "values": [
                 { "key": "description", "text": "upload" },
                 {
                     "key": "files",
                     "file": {
-                        "path": "hello.txt",
-                        "size": 5,
+                        "path": path,
+                        "size": contents.len(),
                         "last_modified": 123,
-                        "content_type": "text/plain",
-                        "contents": [104, 101, 108, 108, 111]
+                        "content_type": "text/plain"
                     }
                 }
             ]
@@ -363,17 +366,20 @@ mod tests {
 
         assert_eq!(data.get_first("description").unwrap(), "upload");
         let Some(FormValue::File(Some(file))) = data.get_first("files") else {
-            panic!("uploaded file missing from form values");
+            panic!("file missing from form values");
         };
         assert_eq!(file, data.files()[0]);
-        assert_eq!(file.name(), "hello.txt");
-        assert_eq!(file.size(), 5);
+        assert_eq!(file.name(), "Cargo.toml");
+        assert_eq!(file.size(), contents.len() as u64);
         assert_eq!(file.last_modified(), 123);
         assert_eq!(file.content_type().as_deref(), Some("text/plain"));
-        assert_eq!(file.read_string().now_or_never().unwrap().unwrap(), "hello");
+        assert_eq!(
+            file.read_string().now_or_never().unwrap().unwrap(),
+            contents
+        );
         assert_eq!(
             file.read_bytes().now_or_never().unwrap().unwrap().as_ref(),
-            b"hello"
+            contents.as_bytes()
         );
     }
 

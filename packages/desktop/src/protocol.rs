@@ -252,7 +252,6 @@ fn respond_to_file_dialog(
                         )
                         .to_string(),
                     ),
-                    contents: Default::default(),
                     path,
                 }),
             },

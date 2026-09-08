@@ -22,12 +22,9 @@ impl LiveviewFormData {
             .values
             .into_iter()
             .map(|value| {
-                let file = value.file.map(|mut metadata| {
-                    metadata.contents = None;
-                    UploadedFileData {
-                        metadata,
-                        storage: files.next(),
-                    }
+                let file = value.file.map(|metadata| UploadedFileData {
+                    metadata,
+                    storage: files.next(),
                 });
                 let data = if let Some(text) = value.text {
                     FormValue::Text(text)
@@ -274,7 +271,6 @@ mod tests {
                     file: Some(SerializedFileData {
                         path: server_file.path().to_path_buf(),
                         size: 11,
-                        contents: Some(Bytes::from_static(b"inline data")),
                         ..SerializedFileData::empty()
                     }),
                 }],
