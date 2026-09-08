@@ -9,7 +9,7 @@ use axum::{
         ws::{Message, WebSocket},
     },
     http::StatusCode,
-    response::Html,
+    response::{Html, IntoResponse},
     routing::*,
 };
 use dioxus_fullstack::FileStream;
@@ -20,6 +20,7 @@ use futures_util::{SinkExt, StreamExt};
 /// This is required to launch a LiveView app using the Axum web framework.
 /// Applications that construct their own router should also mount [`axum_file_upload`] at the
 /// websocket path with `/upload/{token}` appended so file inputs can use HTTP uploads.
+/// Mount [`axum_file_download`] at `/download/{token}` appended to support [`crate::download_file`].
 pub fn axum_socket(ws: WebSocket) -> impl LiveViewSocket {
     ws.map(transform_rx)
         .with(transform_tx)
@@ -75,6 +76,29 @@ pub fn axum_file_upload(view: LiveViewPool) -> MethodRouter {
     })
 }
 
+/// Create the HTTP route that streams files queued by [`crate::download_file`].
+///
+/// Mount this at the websocket path followed by `/download/{token}`, using the same pool.
+/// A token authorizes one GET and expires if unused. The response streams directly to the
+/// browser with an attachment filename; it is never buffered into a websocket message.
+pub fn axum_file_download(view: LiveViewPool) -> MethodRouter {
+    get(move |Path(token): Path<String>| {
+        let view = view.clone();
+        async move {
+            view.downloads.take(&token).unwrap_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    [(axum::http::header::CACHE_CONTROL, "no-store")],
+                    "Unknown or expired LiveView file download",
+                )
+                    .into_response()
+            })
+        }
+    })
+    // Axum normally delegates HEAD to GET, which would consume a single-use token.
+    .head(|| async { StatusCode::METHOD_NOT_ALLOWED })
+}
+
 fn upload_response_error(error: crate::upload::UploadError) -> (StatusCode, String) {
     let status = match error {
         crate::upload::UploadError::UnknownOrExpired => StatusCode::NOT_FOUND,
@@ -104,6 +128,7 @@ impl LiveviewRouter for Router {
 
         let ws_path = format!("{}/ws", route.trim_start_matches('/'));
         let upload_path = format!("{ws_path}/upload/{{token}}");
+        let download_path = format!("{ws_path}/download/{{token}}");
         let title = crate::app_title();
 
         let index_page_with_glue = move |glue: &str| {
@@ -141,7 +166,8 @@ impl LiveviewRouter for Router {
                 })
             }),
         )
-        .route(&upload_path, axum_file_upload(view))
+        .route(&upload_path, axum_file_upload(view.clone()))
+        .route(&download_path, axum_file_download(view))
         .route(
             &route,
             get(move || async move { index_page_with_glue(&interpreter_glue(&ws_path)) }),

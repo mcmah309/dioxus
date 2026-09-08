@@ -63,6 +63,9 @@ class IPC {
             case "query":
               Function("Eval", `"use strict";${event.data};`)();
               break;
+            case "file_download":
+              this.downloadFile(event.data.token);
+              break;
             case "file_upload":
             case "file_upload_complete":
             case "file_upload_error": {
@@ -102,6 +105,24 @@ class IPC {
 
   cancelFileUpload(id) {
     this.postMessage(JSON.stringify({ method: "file_upload_cancel", params: { id } }));
+  }
+
+  downloadFile(token) {
+    const url = new URL(this.ws.url);
+    url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+    url.pathname = `${url.pathname.replace(/\/$/, "")}/download/${encodeURIComponent(token)}`;
+    url.hash = "";
+    const link = document.createElement("a");
+    link.href = url.toString();
+    link.download = "";
+    // An HTTP error (or a missing route returning a fallback page) must not navigate away
+    // from the application. Let the browser stream attachments through its download manager.
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.hidden = true;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
   }
 
   requestFileUpload(method, params) {

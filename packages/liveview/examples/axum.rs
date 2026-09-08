@@ -9,6 +9,21 @@ fn app() -> Element {
         div {
             "hello axum! {num}"
             button { onclick: move |_| num += 1, "Increment" }
+            button {
+                onclick: move |_| {
+                    let contents = format!("Current count: {}\n", num());
+                    let file = dioxus_fullstack::FileStream::from_raw(
+                        "count.txt".to_string(),
+                        Some(contents.len() as u64),
+                        "text/plain; charset=utf-8".to_string(),
+                        axum::body::Body::from(contents).into_data_stream(),
+                    );
+                    if let Err(error) = dioxus_liveview::download_file(file) {
+                        tracing::error!(%error, "Failed to queue count download");
+                    }
+                },
+                "Download count"
+            }
         }
     }
 }

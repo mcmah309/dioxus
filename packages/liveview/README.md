@@ -141,6 +141,59 @@ let upload_router: axum::Router = axum::Router::new()
 # }
 ```
 
+## File downloads
+
+With the `axum` feature, call `download_file` from a LiveView event handler or Dioxus
+task to offer a server-side file to the browser:
+
+```rust,no_run
+# #[cfg(feature = "axum")]
+# async fn export() -> Result<(), Box<dyn std::error::Error>> {
+let file = dioxus_fullstack::FileStream::from_path("report.pdf").await?;
+dioxus_liveview::download_file(file)?;
+# Ok(())
+# }
+```
+
+`FileStream::from_raw` also accepts generated contents or a stream. Only a
+single-use token travels over the websocket. The browser requests the file via
+HTTP GET, and its download manager receives the stream directly, without building
+a JavaScript blob or transferring file bytes through the LiveView event loop.
+The HTTP response supplies the attachment filename, including Unicode filenames.
+
+The default router includes the handler. Custom routers must mount it beside
+the upload route, using the same pool as the websocket:
+
+```rust
+# #[cfg(feature = "axum")]
+# {
+let view = dioxus_liveview::LiveViewPool::new();
+let router: axum::Router = axum::Router::new()
+    .route("/ws/upload/{token}", dioxus_liveview::axum_file_upload(view.clone()))
+    .route("/ws/download/{token}", dioxus_liveview::axum_file_download(view.clone()));
+# }
+```
+
+Append `/download/{token}` to the actual websocket path, including any route
+prefix. As with uploads, the browser uses the HTTP equivalent of the websocket
+URL. Downloads use browser navigation, so they do not require fetch CORS headers.
+
+Success from `download_file` means the instruction was queued, not that the user
+saved the file. Pending downloads default to 128 per connection and expire after
+five minutes; configure these before cloning the pool with
+`with_download_file_limit` and `with_download_timeout`. Expiration and websocket
+disconnects release unrequested streams. Once an HTTP request claims the token,
+the transfer can finish independently of the websocket. Tokens cannot be reused;
+retrying requires another `download_file` call. Range requests and resume are not
+supported, and HEAD requests are rejected without consuming a token.
+
+This API is for saving files. It does not rewrite bytes embedded in `document::eval`,
+data URLs, or component attributes, and is not a persistent URL for a PDF viewer.
+File generation and other blocking work must still run off the LiveView thread;
+the stream itself is polled by the HTTP server.
+
+The `axum` example includes a **Download count** button alongside its counter.
+
 ## Contributing
 
 - Report issues on our [issue tracker](https://github.com/dioxuslabs/dioxus/issues).

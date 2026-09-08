@@ -164,6 +164,8 @@ fn dispatch_event(
 pub struct LiveViewPool {
     pub(crate) pool: LocalPoolHandle,
     pub(crate) uploads: crate::upload::FileUploadRegistry,
+    #[cfg(feature = "axum")]
+    pub(crate) downloads: crate::download::FileDownloadRegistry,
 }
 
 impl Default for LiveViewPool {
@@ -184,6 +186,8 @@ impl LiveViewPool {
                     .unwrap_or(1),
             ),
             uploads: Default::default(),
+            #[cfg(feature = "axum")]
+            downloads: Default::default(),
         }
     }
 
@@ -217,17 +221,44 @@ impl LiveViewPool {
         self
     }
 
-    /// Run an existing VirtualDom on the caller's executor using this pool's upload registry.
+    /// Set the maximum number of downloads awaiting HTTP requests per connection.
     ///
-    /// Pass a clone of this pool to the HTTP upload handler so it can receive files for this
-    /// connection. The returned future is not `Send`; await it on a local executor. Use
+    /// Defaults to [`crate::DEFAULT_DOWNLOAD_FILE_LIMIT`] (128). Configure this before cloning
+    /// the pool for the websocket and HTTP routes. Files stream without buffering their contents.
+    #[cfg(feature = "axum")]
+    pub fn with_download_file_limit(mut self, limit: usize) -> Self {
+        self.downloads = self.downloads.with_file_limit(limit);
+        self
+    }
+
+    /// Set how long the browser has to request a queued download.
+    ///
+    /// Defaults to [`crate::DEFAULT_DOWNLOAD_TIMEOUT`] (five minutes). This does not limit the
+    /// duration of an HTTP transfer that has already started. Configure before cloning the pool.
+    #[cfg(feature = "axum")]
+    pub fn with_download_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.downloads = self.downloads.with_timeout(timeout);
+        self
+    }
+
+    /// Run an existing VirtualDom on the caller's executor using this pool's file registries.
+    ///
+    /// Pass clones of this pool to the HTTP upload and download handlers so they can transfer
+    /// files for this connection. The returned future is not `Send`; await it on a local executor. Use
     /// [`Self::launch_virtualdom`] to create and run a VirtualDom on the pool's threads instead.
     pub async fn run(
         &self,
         vdom: VirtualDom,
         ws: impl LiveViewSocket,
     ) -> Result<(), LiveViewError> {
-        run_with_uploads(vdom, ws, self.uploads.clone()).await
+        run_with_uploads(
+            vdom,
+            ws,
+            self.uploads.clone(),
+            #[cfg(feature = "axum")]
+            self.downloads.clone(),
+        )
+        .await
     }
 
     pub async fn launch(
@@ -254,9 +285,19 @@ impl LiveViewPool {
         make_app: F,
     ) -> Result<(), LiveViewError> {
         let uploads = self.uploads.clone();
+        #[cfg(feature = "axum")]
+        let downloads = self.downloads.clone();
         match self
             .pool
-            .spawn_pinned(move || run_with_uploads(make_app(), ws, uploads))
+            .spawn_pinned(move || {
+                run_with_uploads(
+                    make_app(),
+                    ws,
+                    uploads,
+                    #[cfg(feature = "axum")]
+                    downloads,
+                )
+            })
             .await
         {
             Ok(Ok(_)) => Ok(()),
@@ -322,17 +363,25 @@ impl<S> LiveViewSocket for S where
 ///
 /// You might need to transform the error types of the web backend into the LiveView error type.
 ///
-/// For file uploads, use [`LiveViewPool::run`] with the same pool as your HTTP upload handler.
-/// This standalone function cannot share its upload registry with that handler.
-#[deprecated(note = "Use LiveViewPool::run with the same pool as the HTTP upload handler")]
+/// For file transfers, use [`LiveViewPool::run`] with the same pool as your HTTP file handlers.
+/// This standalone function cannot share its file registries with those handlers.
+#[deprecated(note = "Use LiveViewPool::run with the same pool as the HTTP file handlers")]
 pub async fn run(vdom: VirtualDom, ws: impl LiveViewSocket) -> Result<(), LiveViewError> {
-    run_with_uploads(vdom, ws, Default::default()).await
+    run_with_uploads(
+        vdom,
+        ws,
+        Default::default(),
+        #[cfg(feature = "axum")]
+        Default::default(),
+    )
+    .await
 }
 
 async fn run_with_uploads(
     mut vdom: VirtualDom,
     ws: impl LiveViewSocket,
     uploads: crate::upload::FileUploadRegistry,
+    #[cfg(feature = "axum")] downloads: crate::download::FileDownloadRegistry,
 ) -> Result<(), LiveViewError> {
     #[cfg(all(feature = "devtools", debug_assertions))]
     let mut hot_reload_rx = {
@@ -346,8 +395,14 @@ async fn run_with_uploads(
     // Create the a proxy for query engine
     let (query_tx, mut query_rx) = tokio::sync::mpsc::unbounded_channel();
     let query_engine = QueryEngine::new(query_tx);
+    #[cfg(feature = "axum")]
+    let (download_tx, mut download_rx) = tokio::sync::mpsc::unbounded_channel();
+    #[cfg(feature = "axum")]
+    let download_session = downloads.new_session(download_tx);
     vdom.runtime().in_scope(ScopeId::ROOT, || {
         provide_context(query_engine.clone());
+        #[cfg(feature = "axum")]
+        provide_context(download_session.context());
         init_document();
     });
 
@@ -367,6 +422,10 @@ async fn run_with_uploads(
     let mut upload_cleanups = FuturesUnordered::new();
 
     loop {
+        #[cfg(feature = "axum")]
+        let download_wait = download_rx.recv();
+        #[cfg(not(feature = "axum"))]
+        let download_wait = std::future::pending::<Option<String>>();
         #[cfg(all(feature = "devtools", debug_assertions))]
         let hot_reload_wait = hot_reload_rx.recv();
         #[cfg(not(all(feature = "devtools", debug_assertions)))]
@@ -458,6 +517,10 @@ async fn run_with_uploads(
                 ws.send(text_frame(&serde_json::to_string(&ClientUpdate::Query(query)).unwrap())).await?;
             }
 
+            Some(token) = download_wait => {
+                ws.send(text_frame(&serde_json::to_string(&ClientUpdate::FileDownload { token }).unwrap())).await?;
+            }
+
             Some(msg) = hot_reload_wait => {
                 #[cfg(all(feature = "devtools", debug_assertions))]
                 match msg {
@@ -507,6 +570,8 @@ fn take_edits(mutations: &mut MutationState) -> Option<Vec<u8>> {
 enum ClientUpdate {
     #[serde(rename = "query")]
     Query(String),
+    #[serde(rename = "file_download")]
+    FileDownload { token: String },
     #[serde(rename = "file_upload")]
     FileUpload { id: u64, tokens: Vec<String> },
     #[serde(rename = "file_upload_complete")]
@@ -576,6 +641,8 @@ mod tests {
                 VirtualDom::new(dioxus_core::VNode::empty),
                 socket,
                 uploads,
+                #[cfg(feature = "axum")]
+                Default::default(),
             ));
             Self { tx, rx, server }
         }
