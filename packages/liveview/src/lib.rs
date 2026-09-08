@@ -6,11 +6,17 @@ mod adapters;
 #[allow(unused_imports)]
 pub use adapters::*;
 
+#[cfg(feature = "axum")]
+mod download;
 mod element;
 pub mod pool;
 mod query;
 mod upload;
 use dioxus_interpreter_js::NATIVE_JS;
+#[cfg(feature = "axum")]
+pub use download::{
+    DEFAULT_DOWNLOAD_FILE_LIMIT, DEFAULT_DOWNLOAD_TIMEOUT, FileDownloadError, download_file,
+};
 use futures_util::{SinkExt, StreamExt};
 pub use pool::*;
 mod config;
