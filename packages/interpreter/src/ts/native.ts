@@ -579,8 +579,10 @@ export class NativeInterpreter extends JSChannel_ {
           await this.ipc.uploadFile(tokens[fileIndex], files[fileIndex], controller.signal);
         }
       }));
-      // An HTTP success can come from an app's fallback route. Wait for LiveView to
-      // confirm it received this batch, without blocking any other events.
+      // Each uploadFile call above sends an HTTP PUT to <websocket-path>/upload/<token>
+      // A fallback route can return 2xx even if LiveView's upload handler never received the files.
+      // completeFileUpload asks LiveView over the WebSocket to verify the batch and
+      // dispatch its form event, then waits for confirmation. Other events can continue.
       await this.ipc.completeFileUpload(id);
     } catch (error) {
       controller.abort();
