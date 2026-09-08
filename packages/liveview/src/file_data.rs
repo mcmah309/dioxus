@@ -1,4 +1,4 @@
-use crate::upload::StoredFile;
+use crate::{file_transfer::RemoteFile, upload::StoredFile};
 use bytes::Bytes;
 use dioxus_core::CapturedError;
 use dioxus_html::{
@@ -16,15 +16,15 @@ pub(crate) struct LiveviewFormData {
 }
 
 impl LiveviewFormData {
-    pub(crate) fn new(form: SerializedFormData, files: Vec<Arc<StoredFile>>) -> Self {
+    pub(crate) fn new(form: SerializedFormData, files: Vec<FileStorage>) -> Self {
         let mut files = files.into_iter();
         let values = form
             .values
             .into_iter()
             .map(|value| {
-                let file = value.file.map(|metadata| UploadedFileData {
+                let file = value.file.map(|metadata| LiveviewFileData {
                     metadata,
-                    storage: files.next(),
+                    storage: files.next().unwrap_or(FileStorage::Unavailable),
                 });
                 let data = if let Some(text) = value.text {
                     FormValue::Text(text)
@@ -76,16 +76,37 @@ impl HasFileData for LiveviewFormData {
     }
 }
 
-struct UploadedFileData {
+struct LiveviewFileData {
     metadata: SerializedFileData,
-    storage: Option<Arc<StoredFile>>,
+    storage: FileStorage,
 }
 
-fn require_storage(storage: Option<Arc<StoredFile>>) -> Result<Arc<StoredFile>, CapturedError> {
-    storage.ok_or_else(|| CapturedError::msg("File contents not available"))
+#[derive(Clone)]
+pub(crate) enum FileStorage {
+    Available(Arc<StoredFile>),
+    Remote(Arc<RemoteFile>),
+    Unavailable,
 }
 
-impl NativeFileData for UploadedFileData {
+impl FileStorage {
+    async fn read(self) -> Result<Arc<StoredFile>, CapturedError> {
+        match self {
+            Self::Available(file) => Ok(file),
+            Self::Remote(file) => file.read().await.map_err(CapturedError::msg),
+            Self::Unavailable => Err(CapturedError::msg("File contents not available")),
+        }
+    }
+
+    fn stored(&self) -> Option<&Arc<StoredFile>> {
+        match self {
+            Self::Available(file) => Some(file),
+            Self::Remote(file) => file.stored(),
+            Self::Unavailable => None,
+        }
+    }
+}
+
+impl NativeFileData for LiveviewFileData {
     fn name(&self) -> String {
         self.metadata
             .path
@@ -105,7 +126,7 @@ impl NativeFileData for UploadedFileData {
 
     fn path(&self) -> PathBuf {
         self.storage
-            .as_ref()
+            .stored()
             .map_or_else(PathBuf::new, |file| file.path.to_path_buf())
     }
 
@@ -116,7 +137,7 @@ impl NativeFileData for UploadedFileData {
     fn read_bytes(&self) -> Pin<Box<dyn Future<Output = Result<Bytes, CapturedError>>>> {
         let storage = self.storage.clone();
         Box::pin(async move {
-            let storage = require_storage(storage)?;
+            let storage = storage.read().await?;
             Ok(
                 tokio::task::spawn_blocking(move || std::fs::read(&storage.path))
                     .await??
@@ -128,7 +149,7 @@ impl NativeFileData for UploadedFileData {
     fn read_string(&self) -> Pin<Box<dyn Future<Output = Result<String, CapturedError>>>> {
         let storage = self.storage.clone();
         Box::pin(async move {
-            let storage = require_storage(storage)?;
+            let storage = storage.read().await?;
             Ok(
                 tokio::task::spawn_blocking(move || std::fs::read_to_string(&storage.path))
                     .await??,
@@ -141,7 +162,7 @@ impl NativeFileData for UploadedFileData {
         Box::pin(futures_util::stream::try_unfold(
             state,
             |(file, storage)| async move {
-                let storage = require_storage(storage)?;
+                let storage = storage.read().await?;
                 tokio::task::spawn_blocking(move || {
                     let mut file = match file {
                         Some(file) => file,
@@ -153,7 +174,10 @@ impl NativeFileData for UploadedFileData {
                         return Ok(None);
                     }
                     bytes.truncate(count);
-                    Ok::<_, CapturedError>(Some((Bytes::from(bytes), (Some(file), Some(storage)))))
+                    Ok::<_, CapturedError>(Some((
+                        Bytes::from(bytes),
+                        (Some(file), FileStorage::Available(storage)),
+                    )))
                 })
                 .await?
             },
@@ -174,20 +198,19 @@ mod tests {
     async fn uploaded_file(contents: Bytes) -> (FileData, FileUploadRegistry, UploadSession) {
         let registry = FileUploadRegistry::new(contents.len() as u64);
         let session = registry.new_session();
-        let tokens = registry
-            .register(&session, &[contents.len() as u64])
-            .unwrap();
-        let mut writer = registry.begin(&tokens[0], None).await.unwrap();
+        let reservation = registry.reserve(&session, contents.len() as u64).unwrap();
+        let token = registry.register_reserved(reservation);
+        let mut writer = registry.begin(&token, None).await.unwrap();
         writer.write(contents.clone()).await.unwrap();
         writer.finish().unwrap();
-        let storage = registry.take_completed(&tokens).unwrap().pop().unwrap();
-        let file = FileData::new(UploadedFileData {
+        let storage = registry.take_completed(&token).unwrap();
+        let file = FileData::new(LiveviewFileData {
             metadata: SerializedFileData {
                 path: "browser-name.txt".into(),
                 size: contents.len() as u64,
                 ..SerializedFileData::empty()
             },
-            storage: Some(storage),
+            storage: FileStorage::Available(storage),
         });
         (file, registry, session)
     }
@@ -201,8 +224,8 @@ mod tests {
         drop(file);
         assert!(path.exists());
         assert_eq!(
-            registry.register(&session, &[1]),
-            Err(UploadError::LimitExceeded)
+            registry.reserve(&session, 1).err(),
+            Some(UploadError::LimitExceeded)
         );
         let mut total = 0;
         while let Some(chunk) = stream.next().await {
@@ -212,18 +235,14 @@ mod tests {
             total += chunk.len();
             assert!(path.exists());
             assert_eq!(
-                registry.register(&session, &[1]),
-                Err(UploadError::LimitExceeded)
+                registry.reserve(&session, 1).err(),
+                Some(UploadError::LimitExceeded)
             );
         }
         assert_eq!(total, contents.len());
         drop(stream);
         assert!(!path.exists());
-        assert!(
-            registry
-                .register(&session, &[contents.len() as u64])
-                .is_ok()
-        );
+        assert!(registry.reserve(&session, contents.len() as u64).is_ok());
     }
 
     #[tokio::test]
@@ -236,26 +255,26 @@ mod tests {
         assert!(path.exists());
         drop(stream);
         assert!(!path.exists());
-        assert!(registry.register(&session, &[150_000]).is_ok());
+        assert!(registry.reserve(&session, 150_000).is_ok());
     }
 
     #[tokio::test]
     async fn read_futures_keep_the_temporary_file_alive() {
         let (file, registry, session) = uploaded_file(Bytes::from_static(b"hello")).await;
         let path = file.path();
-        let native = file.inner().downcast_ref::<UploadedFileData>().unwrap();
+        let native = file.inner().downcast_ref::<LiveviewFileData>().unwrap();
         let bytes = native.read_bytes();
         let text = native.read_string();
         drop(file);
         assert!(path.exists());
         assert_eq!(bytes.await.unwrap(), b"hello"[..]);
         assert_eq!(
-            registry.register(&session, &[1]),
-            Err(UploadError::LimitExceeded)
+            registry.reserve(&session, 1).err(),
+            Some(UploadError::LimitExceeded)
         );
         assert_eq!(text.await.unwrap(), "hello");
         assert!(!path.exists());
-        assert!(registry.register(&session, &[5]).is_ok());
+        assert!(registry.reserve(&session, 5).is_ok());
     }
 
     #[tokio::test]

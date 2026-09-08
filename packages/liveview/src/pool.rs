@@ -7,8 +7,8 @@ use crate::{
 };
 
 use crate::{
-    file_data::LiveviewFormData,
-    upload::{StoredFile, UploadSession},
+    file_data::{FileStorage, LiveviewFormData},
+    file_transfer::{FileCommand, PendingFileUpload, RemoteFile},
 };
 use dioxus_core::{Element, Event, ScopeId, VirtualDom, provide_context};
 use dioxus_html::{EventData, HtmlEvent, PlatformEventData};
@@ -24,100 +24,29 @@ use std::{any::Any, collections::HashMap, rc::Rc, sync::Arc};
 use tokio_util::task::LocalPoolHandle;
 
 #[derive(Deserialize, Debug)]
-struct FileUploadStart {
-    event: Box<HtmlEvent>,
-}
-
-#[derive(Deserialize, Debug)]
 #[serde(tag = "method", content = "params")]
 enum IpcMessage {
     #[serde(rename = "user_event")]
     Event(Box<HtmlEvent>),
-    // Validate upload metadata in the handler so malformed requests receive an error response.
-    #[serde(rename = "file_upload")]
-    FileUpload {
-        id: u64,
-        #[serde(flatten)]
-        metadata: serde_json::Value,
+    #[serde(rename = "file_event")]
+    FileEvent {
+        // Keep file IDs available even when the event's metadata cannot be deserialized.
+        event: serde_json::Value,
+        file_ids: Vec<u64>,
     },
-    #[serde(rename = "file_upload_cancel")]
-    FileUploadCancel { id: u64 },
     #[serde(rename = "file_upload_complete")]
-    FileUploadComplete { id: u64 },
+    FileUploadComplete { token: String },
+    #[serde(rename = "file_upload_error")]
+    FileUploadError { token: String, error: String },
     #[serde(rename = "query")]
     Query(QueryResult),
-}
-
-struct PendingFileUpload {
-    event: Option<Box<HtmlEvent>>,
-    tokens: Vec<String>,
-    uploads: crate::upload::FileUploadRegistry,
-    cleanup: Option<AbortHandle>,
-}
-
-impl PendingFileUpload {
-    fn new(
-        upload: FileUploadStart,
-        uploads: crate::upload::FileUploadRegistry,
-        session: &UploadSession,
-    ) -> Result<Self, String> {
-        let EventData::Form(form) = &upload.event.data else {
-            return Err("file upload did not contain a form event".to_string());
-        };
-        let sizes: Vec<_> = form
-            .values
-            .iter()
-            .filter_map(|value| value.file.as_ref().map(|file| file.size))
-            .collect();
-        if sizes.is_empty() {
-            return Err("file upload did not contain any files".to_string());
-        }
-        let tokens = uploads
-            .register(session, &sizes)
-            .map_err(|error| error.to_string())?;
-
-        Ok(Self {
-            event: Some(upload.event),
-            tokens,
-            uploads,
-            cleanup: None,
-        })
-    }
-
-    fn credentials(&self) -> Vec<String> {
-        self.tokens.clone()
-    }
-
-    fn cancel(&mut self) {
-        // Retire the waiter before this ID can be reused by another batch.
-        if let Some(cleanup) = self.cleanup.take() {
-            cleanup.abort();
-        }
-        self.uploads.cancel(&self.tokens);
-        self.tokens.clear();
-    }
-
-    fn finish(mut self) -> Result<(Box<HtmlEvent>, Vec<Arc<StoredFile>>), String> {
-        let files = self
-            .uploads
-            .take_completed(&self.tokens)
-            .map_err(|error| error.to_string())?;
-        self.tokens.clear();
-        Ok((self.event.take().unwrap(), files))
-    }
-}
-
-impl Drop for PendingFileUpload {
-    fn drop(&mut self) {
-        self.cancel();
-    }
 }
 
 fn dispatch_event(
     vdom: &VirtualDom,
     query_engine: &QueryEngine,
     event: Box<HtmlEvent>,
-    files: Vec<Arc<StoredFile>>,
+    files: Vec<FileStorage>,
 ) {
     let HtmlEvent {
         element,
@@ -172,31 +101,31 @@ impl LiveViewPool {
         }
     }
 
-    /// Set the total bytes each LiveView connection may hold in incoming and completed uploads.
+    /// Set the upload storage limit in bytes for each LiveView connection.
     ///
-    /// Files are streamed to temporary files. Their declared sizes count toward the limit from
-    /// registration until the last file handle or reader is dropped, including handles retained
-    /// by the application after the event. Defaults to [`crate::DEFAULT_UPLOAD_LIMIT`] (1 GiB).
-    pub fn with_upload_limit(mut self, limit: u64) -> Self {
+    /// Unread files reserve their declared sizes without transferring contents. A read streams
+    /// the file to temporary storage; the reservation lasts until its final handle or reader
+    /// is dropped, or the transfer fails. Defaults to [`crate::DEFAULT_UPLOAD_STORAGE_LIMIT`] (1 GiB).
+    pub fn with_upload_storage_limit(mut self, limit: u64) -> Self {
         self.uploads = self.uploads.with_limit(limit);
         self
     }
 
-    /// Set the maximum number of incoming and retained files per LiveView connection.
+    /// Set the maximum number of unread, incoming, and retained files per LiveView connection.
     ///
-    /// Each file counts from registration until its last handle or reader is dropped, across
-    /// all batches. This also counts zero-byte files, independently of the byte limit. Defaults
-    /// to [`crate::DEFAULT_UPLOAD_FILE_LIMIT`] (1024 files).
+    /// Each file counts from creation of its handle until its final handle or reader is dropped,
+    /// or the transfer fails. Zero-byte files also count. Defaults to
+    /// [`crate::DEFAULT_UPLOAD_FILE_LIMIT`] (1024 files).
     pub fn with_upload_file_limit(mut self, limit: usize) -> Self {
         self.uploads = self.uploads.with_file_limit(limit);
         self
     }
 
-    /// Set how long a registered upload batch may wait for its first HTTP request.
+    /// Set how long a requested file transfer may wait for its HTTP request to start.
     ///
-    /// Unused batches release their quota reservations when this timeout expires. Once any file
-    /// starts uploading, the batch remains valid until completion or cancellation by the websocket.
-    /// Defaults to [`crate::DEFAULT_UPLOAD_TIMEOUT`] (five minutes).
+    /// The timeout begins on the first read, not on selection. Expired requests release their
+    /// quota and report an error to readers. Once HTTP uploading starts, it remains valid until
+    /// completion or cancellation. Defaults to [`crate::DEFAULT_UPLOAD_TIMEOUT`] (five minutes).
     pub fn with_upload_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.uploads = self.uploads.with_timeout(timeout);
         self
@@ -299,21 +228,6 @@ impl<S> LiveViewSocket for S where
 {
 }
 
-/// The primary event loop for the VirtualDom waiting for user input
-///
-/// This function makes it easy to integrate Dioxus LiveView with any socket-based framework.
-///
-/// As long as your framework can provide a Sink and Stream of Bytes, you can use this function.
-///
-/// You might need to transform the error types of the web backend into the LiveView error type.
-///
-/// For file uploads, use [`LiveViewPool::run`] with the same pool as your HTTP upload handler.
-/// This standalone function cannot share its upload registry with that handler.
-#[deprecated(note = "Use LiveViewPool::run with the same pool as the HTTP upload handler")]
-pub async fn run(vdom: VirtualDom, ws: impl LiveViewSocket) -> Result<(), LiveViewError> {
-    run_with_uploads(vdom, ws, Default::default()).await
-}
-
 async fn run_with_uploads(
     mut vdom: VirtualDom,
     ws: impl LiveViewSocket,
@@ -348,7 +262,9 @@ async fn run_with_uploads(
     }
 
     let upload_session = uploads.new_session();
-    let mut pending_file_uploads = HashMap::<u64, PendingFileUpload>::new();
+    let (file_tx, mut file_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut remote_files = HashMap::<u64, std::sync::Weak<RemoteFile>>::new();
+    let mut pending_file_uploads = HashMap::<String, PendingFileUpload>::new();
     let mut upload_cleanups = FuturesUnordered::new();
 
     loop {
@@ -362,8 +278,11 @@ async fn run_with_uploads(
             _ = vdom.wait_for_work() => {}
 
             Some(result) = upload_cleanups.next() => {
-                if let Ok(id) = result {
-                    pending_file_uploads.remove(&id);
+                if let Ok(token) = result {
+                    pending_file_uploads.remove(&token);
+                    ws.send(text_frame(&serde_json::to_string(
+                        &ClientUpdate::FileUploadCanceled { token }
+                    ).unwrap())).await?;
                 }
             }
 
@@ -379,52 +298,56 @@ async fn run_with_uploads(
                                 IpcMessage::Event(evt) => {
                                     dispatch_event(&vdom, &query_engine, evt, Vec::new());
                                 }
-                                IpcMessage::FileUpload { id, metadata } => {
-                                    let upload = if pending_file_uploads.contains_key(&id) {
-                                        Err("received a duplicate file upload ID".to_string())
-                                    } else {
-                                        serde_json::from_value::<FileUploadStart>(metadata)
-                                            .map_err(|error| format!("invalid file upload metadata: {error}"))
-                                            .and_then(|upload| PendingFileUpload::new(upload, uploads.clone(), &upload_session))
-                                    };
-                                    let response = match upload {
-                                        Ok(mut upload) => {
-                                            let tokens = upload.credentials();
-                                            let cleanup_tokens = tokens.clone();
-                                            let cleanup_uploads = uploads.clone();
-                                            let (abort, registration) = AbortHandle::new_pair();
-                                            upload.cleanup = Some(abort);
-                                            upload_cleanups.push(Abortable::new(async move {
-                                                cleanup_uploads.wait_for_cleanup(&cleanup_tokens).await;
-                                                id
-                                            }, registration));
-                                            pending_file_uploads.insert(id, upload);
-                                            ClientUpdate::FileUpload { id, tokens }
+                                IpcMessage::FileEvent { event, file_ids } => {
+                                    let event = match serde_json::from_value::<Box<HtmlEvent>>(event) {
+                                        Ok(event) => event,
+                                        Err(error) => {
+                                            tracing::warn!(%error, "Invalid LiveView file event");
+                                            for id in file_ids {
+                                                let _ = file_tx.send(FileCommand::Release { id });
+                                            }
+                                            continue;
                                         }
-                                        Err(error) => ClientUpdate::FileUploadError { id, error },
                                     };
-                                    ws.send(text_frame(
-                                        &serde_json::to_string(&response).unwrap(),
-                                    ))
-                                    .await?;
-                                }
-                                IpcMessage::FileUploadCancel { id } => {
-                                    pending_file_uploads.remove(&id);
-                                }
-                                IpcMessage::FileUploadComplete { id } => {
-                                    let result = pending_file_uploads.remove(&id).ok_or_else(|| {
-                                        "received file upload completion without a pending upload".to_string()
-                                    }).and_then(PendingFileUpload::finish);
-                                    let response = match result {
-                                        Ok((event, files)) => {
-                                            dispatch_event(&vdom, &query_engine, event, files);
-                                            ClientUpdate::FileUploadComplete { id }
+                                    let metadata = match &event.data {
+                                        EventData::Form(form) => form.values.iter()
+                                            .filter_map(|value| value.file.as_ref()).collect::<Vec<_>>(),
+                                        _ => Vec::new(),
+                                    };
+                                    if metadata.len() != file_ids.len() {
+                                        tracing::warn!("LiveView file event metadata does not match its handles");
+                                        for id in file_ids {
+                                            let _ = file_tx.send(FileCommand::Release { id });
                                         }
-                                        Err(error) => ClientUpdate::FileUploadError { id, error },
-                                    };
-                                    ws.send(text_frame(
-                                        &serde_json::to_string(&response).unwrap(),
-                                    )).await?;
+                                        continue;
+                                    }
+                                    remote_files.retain(|_, file| file.strong_count() > 0);
+                                    let storage = file_ids.into_iter().zip(metadata).map(|(id, metadata)| {
+                                        let file = if let Some(file) = remote_files.get(&id).and_then(std::sync::Weak::upgrade) {
+                                            // The existing owner already retains the browser File. Release the
+                                            // extra reference acquired when this event was sent.
+                                            let _ = file_tx.send(FileCommand::Release { id });
+                                            file
+                                        } else {
+                                            let file = Arc::new(RemoteFile::new(
+                                                id, metadata.size, &upload_session, uploads.clone(), file_tx.clone(),
+                                            ));
+                                            remote_files.insert(id, Arc::downgrade(&file));
+                                            file
+                                        };
+                                        FileStorage::Remote(file)
+                                    }).collect();
+                                    dispatch_event(&vdom, &query_engine, event, storage);
+                                }
+                                IpcMessage::FileUploadComplete { token } => {
+                                    if let Some(upload) = pending_file_uploads.remove(&token) {
+                                        upload.finish(None);
+                                    }
+                                }
+                                IpcMessage::FileUploadError { token, error } => {
+                                    if let Some(upload) = pending_file_uploads.remove(&token) {
+                                        upload.finish(Some(error));
+                                    }
                                 }
                                 IpcMessage::Query(result) => {
                                     query_engine.send(result);
@@ -436,6 +359,33 @@ async fn run_with_uploads(
                     Some(Err(_e)) => {}
                     None => return Ok(()),
                 }
+            }
+
+            Some(command) = file_rx.recv() => {
+                let update = match command {
+                    FileCommand::Read { id, mut upload } => {
+                        if upload.is_closed() {
+                            continue;
+                        }
+                        let token = upload.token.clone();
+                        let cleanup_uploads = uploads.clone();
+                        let cleanup_token = token.clone();
+                        let (abort, registration) = AbortHandle::new_pair();
+                        upload.cleanup = Some(abort);
+                        upload_cleanups.push(Abortable::new(async move {
+                            cleanup_uploads.wait_for_cleanup(&cleanup_token).await;
+                            cleanup_token
+                        }, registration));
+                        pending_file_uploads.insert(token.clone(), upload);
+                        ClientUpdate::FileUpload { id, token }
+                    }
+                    FileCommand::Cancel { token } => {
+                        pending_file_uploads.remove(&token);
+                        ClientUpdate::FileUploadCanceled { token }
+                    }
+                    FileCommand::Release { id } => ClientUpdate::FileRelease { id },
+                };
+                ws.send(text_frame(&serde_json::to_string(&update).unwrap())).await?;
             }
 
             // handle any new queries
@@ -493,11 +443,11 @@ enum ClientUpdate {
     #[serde(rename = "query")]
     Query(String),
     #[serde(rename = "file_upload")]
-    FileUpload { id: u64, tokens: Vec<String> },
-    #[serde(rename = "file_upload_complete")]
-    FileUploadComplete { id: u64 },
-    #[serde(rename = "file_upload_error")]
-    FileUploadError { id: u64, error: String },
+    FileUpload { id: u64, token: String },
+    #[serde(rename = "file_upload_canceled")]
+    FileUploadCanceled { token: String },
+    #[serde(rename = "file_release")]
+    FileRelease { id: u64 },
 }
 
 #[cfg(test)]
@@ -549,20 +499,43 @@ mod tests {
     struct TestConnection {
         tx: UnboundedSender<Result<Vec<u8>, LiveViewError>>,
         rx: UnboundedReceiver<Vec<u8>>,
+        forms: tokio::sync::mpsc::UnboundedReceiver<Rc<dioxus_html::FormData>>,
         server: tokio::task::JoinHandle<Result<(), LiveViewError>>,
     }
 
     impl TestConnection {
         fn new(uploads: crate::upload::FileUploadRegistry) -> Self {
+            fn app(
+                forms: tokio::sync::mpsc::UnboundedSender<Rc<dioxus_html::FormData>>,
+            ) -> Element {
+                use dioxus::prelude::*;
+                let mut visible = use_signal(|| true);
+                if !visible() {
+                    return rsx! { div {} };
+                }
+                rsx! {
+                    input {
+                        r#type: "file",
+                        onchange: move |event| { let _ = forms.send(event.data()); },
+                        onreset: move |_| visible.set(false),
+                    }
+                }
+            }
             let (tx, incoming) = unbounded();
             let (outgoing, rx) = unbounded();
+            let (forms_tx, forms) = tokio::sync::mpsc::unbounded_channel();
             let socket = TestSocket { incoming, outgoing };
             let server = tokio::task::spawn_local(run_with_uploads(
-                VirtualDom::new(dioxus_core::VNode::empty),
+                VirtualDom::new_with_props(app, forms_tx),
                 socket,
                 uploads,
             ));
-            Self { tx, rx, server }
+            Self {
+                tx,
+                rx,
+                forms,
+                server,
+            }
         }
 
         fn send(&self, method: &str, params: serde_json::Value) {
@@ -574,47 +547,67 @@ mod tests {
                 .unwrap();
         }
 
-        fn register(&self, id: u64, size: u64) {
-            self.send(
-                "file_upload",
+        async fn select(&mut self, files: &[(u64, &str, u64)]) -> Rc<dioxus_html::FormData> {
+            let mut values = vec![serde_json::json!({"key": "description", "text": "upload"})];
+            values.extend(files.iter().map(|(_, name, size)| {
                 serde_json::json!({
-                    "id": id,
+                    "key": "files", "file": {
+                        "path": name, "size": size, "last_modified": 123,
+                        "content_type": "application/octet-stream",
+                    },
+                })
+            }));
+            self.send(
+                "file_event",
+                serde_json::json!({
+                    "file_ids": files.iter().map(|(id, _, _)| id).collect::<Vec<_>>(),
                     "event": {
-                        "element": 0, "name": "change", "bubbles": true,
-                        "data": { "values": [{ "key": "file", "file": {
-                            "path": "upload.bin", "size": size, "last_modified": 0,
-                            "content_type": "application/octet-stream",
-                        } }] },
+                        "element": 1, "name": "change", "bubbles": true,
+                        "data": { "values": values },
                     },
                 }),
             );
+            tokio::time::timeout(Duration::from_secs(1), self.forms.recv())
+                .await
+                .expect("file events must be delivered before any HTTP transfer")
+                .unwrap()
         }
 
-        async fn receive(&mut self, kind: &str, id: u64) -> serde_json::Value {
-            let response = tokio::time::timeout(Duration::from_secs(1), async {
+        async fn token(&mut self, id: u64) -> String {
+            tokio::time::timeout(Duration::from_secs(1), async {
                 loop {
                     let frame = self.rx.next().await.expect("connection should stay open");
-                    if frame[0] == 0 {
-                        let message: serde_json::Value =
-                            serde_json::from_slice(&frame[1..]).unwrap();
-                        if message["type"] != "query" {
-                            break message;
-                        }
+                    if frame[0] != 0 {
+                        continue;
+                    }
+                    let message: serde_json::Value = serde_json::from_slice(&frame[1..]).unwrap();
+                    if message["type"] == "file_upload" {
+                        assert_eq!(message["data"]["id"], id);
+                        break message["data"]["token"].as_str().unwrap().to_string();
                     }
                 }
             })
             .await
-            .expect("server should respond without waiting for another upload");
-            assert_eq!(response["type"], kind);
-            assert_eq!(response["data"]["id"], id);
-            response["data"].clone()
+            .expect("reading a file must request its transfer")
         }
 
-        async fn token(&mut self, id: u64) -> String {
-            self.receive("file_upload", id).await["tokens"][0]
-                .as_str()
-                .unwrap()
-                .to_string()
+        async fn unmount_input(&mut self) {
+            self.send(
+                "user_event",
+                serde_json::json!({
+                    "element": 1, "name": "reset", "bubbles": true, "data": {"values": []},
+                }),
+            );
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while let Some(frame) = self.rx.next().await {
+                    if frame[0] == 1 {
+                        return;
+                    }
+                }
+                panic!("connection closed before removing the input");
+            })
+            .await
+            .unwrap();
         }
 
         async fn close(self) {
@@ -624,66 +617,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_batches_share_quota_and_clean_up_independently() {
+    async fn concurrent_files_share_quota_and_clean_up_independently() {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let uploads = crate::upload::FileUploadRegistry::new(6);
                 let mut client = TestConnection::new(uploads.clone());
-                client.register(1, 3);
-                client.register(2, 3);
-                let first = client.token(1).await;
-                let second = client.token(2).await;
-                client.register(3, 1);
+                let first = client
+                    .select(&[(1, "first.bin", 3)])
+                    .await
+                    .files()
+                    .remove(0);
+                let second = client
+                    .select(&[(2, "second.bin", 3)])
+                    .await
+                    .files()
+                    .remove(0);
+                let rejected = client
+                    .select(&[(3, "rejected.bin", 1)])
+                    .await
+                    .files()
+                    .remove(0);
                 assert!(
-                    client.receive("file_upload_error", 3).await["error"]
-                        .as_str()
-                        .unwrap()
+                    rejected
+                        .read_bytes()
+                        .await
+                        .unwrap_err()
+                        .to_string()
                         .contains("upload data limit")
                 );
+                drop(rejected);
 
-                // A duplicate ID must not replace or cancel the original batch.
-                client.register(1, 0);
-                assert!(
-                    client.receive("file_upload_error", 1).await["error"]
-                        .as_str()
-                        .unwrap()
-                        .contains("duplicate")
+                let mut first_read = first.byte_stream();
+                let mut second_read = second.byte_stream();
+                assert!(futures_util::poll!(first_read.next()).is_pending());
+                let first_token = client.token(1).await;
+                assert!(futures_util::poll!(second_read.next()).is_pending());
+                let second_token = client.token(2).await;
+                let mut writer = uploads.begin(&first_token, Some(3)).await.unwrap();
+                writer
+                    .write(bytes::Bytes::from_static(b"abc"))
+                    .await
+                    .unwrap();
+                writer.finish().unwrap();
+
+                // Dropping every owner cancels this transfer without affecting the other reader.
+                drop(first);
+                drop(first_read);
+                assert!(matches!(
+                    uploads.begin(&first_token, None).await,
+                    Err(crate::upload::UploadError::UnknownOrExpired)
+                ));
+                let third = client
+                    .select(&[(4, "third.bin", 3)])
+                    .await
+                    .files()
+                    .remove(0);
+                let mut writer = uploads.begin(&second_token, Some(3)).await.unwrap();
+                writer
+                    .write(bytes::Bytes::from_static(b"def"))
+                    .await
+                    .unwrap();
+                writer.finish().unwrap();
+                client.send(
+                    "file_upload_complete",
+                    serde_json::json!({"token": second_token}),
                 );
-                let mut file = uploads.begin(&first, Some(3)).await.unwrap();
-                file.write(bytes::Bytes::from_static(b"abc")).await.unwrap();
-                file.finish().unwrap();
+                assert_eq!(second_read.next().await.unwrap().unwrap(), b"def"[..]);
+                drop(second_read);
+                drop(second);
 
-                // Cancel and immediately reuse an ID before its old cleanup future is drained.
-                client.send("file_upload_cancel", serde_json::json!({ "id": 1 }));
-                client.register(1, 3);
-                let replacement = client.token(1).await;
-                assert!(matches!(
-                    uploads.begin(&first, None).await,
-                    Err(crate::upload::UploadError::UnknownOrExpired)
-                ));
-                let mut file = uploads.begin(&second, Some(3)).await.unwrap();
-                file.write(bytes::Bytes::from_static(b"def")).await.unwrap();
-                file.finish().unwrap();
-                client.send("file_upload_complete", serde_json::json!({ "id": 2 }));
-                client.receive("file_upload_complete", 2).await;
-
-                client.register(3, 3);
-                let third = client.token(3).await;
-                client.register(4, 1);
-                client.receive("file_upload_error", 4).await;
-                client.send("file_upload_complete", serde_json::json!({ "id": 999 }));
-                client.receive("file_upload_error", 999).await;
-                let file = uploads.begin(&replacement, Some(3)).await.unwrap();
-
-                // Disconnect cancels both active and unused batches.
+                let mut third_read = third.byte_stream();
+                assert!(futures_util::poll!(third_read.next()).is_pending());
+                let third_token = client.token(4).await;
+                let writer = uploads.begin(&third_token, Some(3)).await.unwrap();
+                let unread = client
+                    .select(&[(5, "unread.bin", 3)])
+                    .await
+                    .files()
+                    .remove(0);
                 client.close().await;
-                file.cancelled().await;
+                writer.cancelled().await;
+                assert!(third_read.next().await.unwrap().is_err());
+                assert!(unread.read_bytes().await.is_err());
                 assert!(matches!(
-                    uploads.begin(&replacement, None).await,
-                    Err(crate::upload::UploadError::UnknownOrExpired)
-                ));
-                assert!(matches!(
-                    uploads.begin(&third, None).await,
+                    uploads.begin(&third_token, None).await,
                     Err(crate::upload::UploadError::UnknownOrExpired)
                 ));
             })
@@ -691,133 +708,126 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_expired_batch_does_not_cancel_another_active_batch() {
+    async fn an_expired_read_does_not_cancel_another_active_file() {
         tokio::task::LocalSet::new()
             .run_until(async {
                 let uploads =
                     crate::upload::FileUploadRegistry::new(3).with_timeout(Duration::from_secs(10));
                 let mut client = TestConnection::new(uploads.clone());
-                client.register(1, 1);
-                client.register(2, 2);
-                let first = client.token(1).await;
-                let second = client.token(2).await;
-                let mut file = uploads.begin(&second, Some(2)).await.unwrap();
-
+                let first = client
+                    .select(&[(1, "first.bin", 1)])
+                    .await
+                    .files()
+                    .remove(0);
+                let second = client
+                    .select(&[(2, "second.bin", 2)])
+                    .await
+                    .files()
+                    .remove(0);
+                // Selecting files does not start the upload timeout.
                 tokio::time::advance(Duration::from_secs(11)).await;
-                client.send("file_upload_complete", serde_json::json!({ "id": 1 }));
-                client.receive("file_upload_error", 1).await;
+                let mut first_read = first.byte_stream();
+                let mut second_read = second.byte_stream();
+                assert!(futures_util::poll!(first_read.next()).is_pending());
+                let first_token = client.token(1).await;
+                assert!(futures_util::poll!(second_read.next()).is_pending());
+                let second_token = client.token(2).await;
+                let mut writer = uploads.begin(&second_token, Some(2)).await.unwrap();
+                tokio::time::advance(Duration::from_secs(11)).await;
+                assert!(first_read.next().await.unwrap().is_err());
                 assert!(matches!(
-                    uploads.begin(&first, None).await,
+                    uploads.begin(&first_token, None).await,
                     Err(crate::upload::UploadError::UnknownOrExpired)
                 ));
-                client.register(3, 1);
-                let third = client.token(3).await;
-
-                file.write(bytes::Bytes::from_static(b"ok")).await.unwrap();
-                file.finish().unwrap();
-                client.send("file_upload_complete", serde_json::json!({ "id": 2 }));
-                client.receive("file_upload_complete", 2).await;
+                let third = client
+                    .select(&[(3, "third.bin", 1)])
+                    .await
+                    .files()
+                    .remove(0);
+                writer
+                    .write(bytes::Bytes::from_static(b"ok"))
+                    .await
+                    .unwrap();
+                writer.finish().unwrap();
+                client.send(
+                    "file_upload_complete",
+                    serde_json::json!({"token": second_token}),
+                );
+                assert_eq!(second_read.next().await.unwrap().unwrap(), b"ok"[..]);
                 client.close().await;
-                assert!(matches!(
-                    uploads.begin(&third, None).await,
-                    Err(crate::upload::UploadError::UnknownOrExpired)
-                ));
+                assert!(third.read_bytes().await.is_err());
             })
             .await;
     }
 
-    fn pending_upload(uploads: crate::upload::FileUploadRegistry) -> PendingFileUpload {
-        let message: IpcMessage = serde_json::from_value(serde_json::json!({
-            "method": "file_upload",
-            "params": {
-                "id": 0,
-                "event": {
-                    "element": 0,
-                    "name": "change",
-                    "bubbles": true,
-                    "data": {
-                        "values": [
-                            { "key": "description", "text": "upload" },
-                            {
-                                "key": "files",
-                                "file": {
-                                    "path": "hello.bin",
-                                    "size": 3,
-                                    "last_modified": 123,
-                                    "content_type": "application/octet-stream"
-                                }
-                            },
-                            {
-                                "key": "files",
-                                "file": {
-                                    "path": "empty.bin",
-                                    "size": 0,
-                                    "last_modified": 456,
-                                    "content_type": "application/octet-stream"
-                                }
-                            }
-                        ]
-                    }
-                }
-            }
-        }))
-        .unwrap();
-        let IpcMessage::FileUpload {
-            metadata: upload, ..
-        } = message
-        else {
-            unreachable!()
-        };
-        PendingFileUpload::new(
-            serde_json::from_value(upload).unwrap(),
-            uploads.clone(),
-            &uploads.new_session(),
-        )
-        .unwrap()
-    }
-
     #[tokio::test]
-    async fn http_uploads_are_attached_to_the_form_event() {
-        let uploads = crate::upload::FileUploadRegistry::default();
-        let upload = pending_upload(uploads.clone());
-        let credentials = upload.credentials();
-        let mut file = uploads.begin(&credentials[0], Some(3)).await.unwrap();
-        file.write(bytes::Bytes::from_static(&[0, 255, 128]))
-            .await
-            .unwrap();
-        file.finish().unwrap();
-        uploads
-            .begin(&credentials[1], Some(0))
-            .await
-            .unwrap()
-            .finish()
-            .unwrap();
-
-        let (event, files) = upload.finish().unwrap();
-        let EventData::Form(form) = event.data else {
-            unreachable!()
-        };
-        let form = dioxus_html::FormData::new(LiveviewFormData::new(form, files));
-        assert_eq!(form.get_first("description").unwrap(), "upload");
-        let files = form.files();
-        assert_eq!(files[0].name(), "hello.bin");
-        assert_eq!(files[0].size(), 3);
-        assert_eq!(files[0].last_modified(), 123);
-        assert_eq!(
-            files[0].content_type().as_deref(),
-            Some("application/octet-stream")
-        );
-        assert_eq!(
-            files[0].read_bytes().await.unwrap().as_ref(),
-            &[0, 255, 128]
-        );
-        assert!(files[1].read_bytes().await.unwrap().is_empty());
-        assert_eq!(files[1].name(), "empty.bin");
-        assert!(files[0].path().is_file());
-        let paths: Vec<_> = files.iter().map(|file| file.path()).collect();
-        drop(form);
-        assert!(paths.iter().all(|path| path.exists()));
-        drop(files);
-        assert!(paths.iter().all(|path| !path.exists()));
+    async fn file_events_deliver_lazy_owned_handles() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                #[derive(Deserialize)]
+                struct Values {
+                    description: String,
+                    files: Vec<dioxus_html::FileData>,
+                }
+                let uploads = crate::upload::FileUploadRegistry::default();
+                let mut client = TestConnection::new(uploads.clone());
+                let form = client
+                    .select(&[(1, "hello.bin", 3), (2, "empty.bin", 0)])
+                    .await;
+                let parsed: Values = form.parsed_values().unwrap();
+                assert_eq!(parsed.description, "upload");
+                assert_eq!(parsed.files[0].name(), "hello.bin");
+                assert_eq!(parsed.files[0].size(), 3);
+                assert_eq!(parsed.files[0].last_modified(), 123);
+                assert_eq!(
+                    parsed.files[0].content_type().as_deref(),
+                    Some("application/octet-stream")
+                );
+                assert!(parsed.files[0].path().as_os_str().is_empty());
+                drop(form);
+                let again = client
+                    .select(&[(1, "hello.bin", 3)])
+                    .await
+                    .files()
+                    .remove(0);
+                let mut read = Box::pin(parsed.files[0].read_bytes());
+                let mut another_read = Box::pin(parsed.files[0].read_bytes());
+                assert!(futures_util::poll!(read.as_mut()).is_pending());
+                assert!(futures_util::poll!(another_read.as_mut()).is_pending());
+                let token = client.token(1).await;
+                // The existing read and the second, unread file both outlive their input.
+                client.unmount_input().await;
+                let mut writer = uploads.begin(&token, Some(3)).await.unwrap();
+                writer
+                    .write(bytes::Bytes::from_static(&[0, 255, 128]))
+                    .await
+                    .unwrap();
+                writer.finish().unwrap();
+                client.send("file_upload_complete", serde_json::json!({"token": token}));
+                assert_eq!(read.await.unwrap().as_ref(), &[0, 255, 128]);
+                assert_eq!(another_read.await.unwrap().as_ref(), &[0, 255, 128]);
+                // The second event's handle reuses the first handle's transfer and storage.
+                assert_eq!(again.path(), parsed.files[0].path());
+                assert_eq!(again.read_bytes().await.unwrap().as_ref(), &[0, 255, 128]);
+                drop(again);
+                let mut read = Box::pin(parsed.files[1].read_bytes());
+                assert!(futures_util::poll!(read.as_mut()).is_pending());
+                let token = client.token(2).await;
+                uploads
+                    .begin(&token, Some(0))
+                    .await
+                    .unwrap()
+                    .finish()
+                    .unwrap();
+                client.send("file_upload_complete", serde_json::json!({"token": token}));
+                assert!(read.await.unwrap().is_empty());
+                assert_eq!(parsed.files[1].name(), "empty.bin");
+                let paths: Vec<_> = parsed.files.iter().map(|file| file.path()).collect();
+                assert!(paths.iter().all(|path| path.is_file()));
+                drop(parsed);
+                assert!(paths.iter().all(|path| !path.exists()));
+                client.close().await;
+            })
+            .await;
     }
 }

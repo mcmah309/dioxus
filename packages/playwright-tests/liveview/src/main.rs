@@ -61,27 +61,21 @@ fn app() -> Element {
             onchange: move |event| async move {
                 let mut uploads = Vec::new();
                 for file in event.files() {
-                    let mut stream = file.byte_stream();
-                    let mut size = 0;
-                    let mut first = 0;
-                    let mut last = 0;
-                    while let Some(chunk) = stream.next().await {
-                        let bytes = chunk.unwrap();
-                        assert!(bytes.len() <= 64 * 1024);
-                        if size == 0 { first = bytes.first().copied().unwrap_or_default(); }
-                        last = bytes.last().copied().unwrap_or_default();
-                        size += bytes.len();
-                    }
-                    uploads.push(format!("{}|{size}|{first}|{last}", file.name()));
+                    uploads.push(describe_stream(file).await);
                 }
                 large_upload.set(uploads.join("\n"));
             },
         }
         pre { id: "large-upload", "{large_upload}" }
-        input {
-            id: "retained-file-picker",
-            r#type: "file",
-            onchange: move |event| retained_files.set(event.files()),
+        form {
+            id: "retained-form",
+            onsubmit: move |event| retained_files.set(event.files()),
+            input {
+                id: "retained-file-picker",
+                name: "files",
+                r#type: "file",
+                onchange: move |event| retained_files.set(event.files()),
+            }
         }
         pre { id: "retained-files", "{retained_files.read().len()}" }
         button { onclick: move |_| retained_files.clear(), "Release files" }
@@ -134,6 +128,26 @@ fn FilePicker(id: &'static str, name: Option<&'static str>) -> Element {
         span { id: "{id}-description", "{description}" }
         span { id: "{id}-counts", "{input_count},{change_count}" }
     }
+}
+
+async fn describe_stream(file: dioxus::html::FileData) -> String {
+    let mut stream = file.byte_stream();
+    let mut size = 0;
+    let mut first = 0;
+    let mut last = 0;
+    while let Some(chunk) = stream.next().await {
+        let bytes = match chunk {
+            Ok(bytes) => bytes,
+            Err(error) => return format!("{}|ERROR: {error}", file.name()),
+        };
+        assert!(bytes.len() <= 64 * 1024);
+        if size == 0 {
+            first = bytes.first().copied().unwrap_or_default();
+        }
+        last = bytes.last().copied().unwrap_or_default();
+        size += bytes.len();
+    }
+    format!("{}|{size}|{first}|{last}", file.name())
 }
 
 async fn describe_files(files: Vec<dioxus::html::FileData>) -> String {

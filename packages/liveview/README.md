@@ -35,17 +35,18 @@ Dioxus-LiveView exports some primitives to wire up an app into an existing backe
 
 ## File uploads
 
-Files stream over HTTP into files in the system temporary directory. Each LiveView
-connection defaults to a 1 GiB cap and a 1024-file cap across incoming and retained
-uploads, and registered batches have five minutes to start uploading. Set any of
-these values before cloning the pool for the WebSocket and HTTP upload routes:
+Files stay in the browser until application code reads their contents. Reads transfer
+files over HTTP into the system temporary directory. Each LiveView connection defaults
+to a 1 GiB storage cap and a 1024-file cap across unread, incoming, and retained files. Once a
+read requests a transfer, the browser has five minutes to start its HTTP request.
+Set these values before cloning the pool for the WebSocket and HTTP upload routes:
 
 ```rust
 use dioxus_liveview::LiveViewPool;
 use std::time::Duration;
 
 let view = LiveViewPool::new()
-    .with_upload_limit(256 * 1024 * 1024)
+    .with_upload_storage_limit(256 * 1024 * 1024)
     .with_upload_file_limit(100)
     .with_upload_timeout(Duration::from_secs(60));
 ```
@@ -71,40 +72,53 @@ let router: axum::Router = axum::Router::new().route(
 Append `/upload/{token}` to your actual WebSocket path, including any route prefix.
 The default LiveView router already mounts this handler. A fallback page or a
 redirect at the upload URL cannot receive the file, even if it returns HTTP success.
-LiveView confirms receipt over the WebSocket before dispatching the form event;
-failed uploads report an error and leave the connection available for retrying.
+LiveView verifies receipt before resolving the read; a failed transfer returns an
+error through the file's read API.
 
-Multiple upload events can run concurrently on one connection. Each batch has its
-own credentials, completion response, cancellation, and timeout; all batches and
-retained files share the connection's byte and file-count limits. The browser sends
-up to four files concurrently within each batch and preserves the selection's file
-order in the delivered event.
+Form events deliver metadata and file handles immediately. Accessing
+`name()`, `size()`, `files()`, or `FormData::parsed_values()` does not transfer contents.
+The first awaited `read_bytes()` or `read_string()`, or the first poll of
+`byte_stream()`, requests the file. Submitting a form only uploads files that its
+handler reads; reading from `onchange` intentionally starts the transfer earlier.
 
-Clicks, text edits, and other events proceed while files upload. Events carrying
-files are dispatched only after their own batch completes, so they can arrive
-after later UI events or faster uploads, including uploads from the same input.
+Concurrent readers share one transfer, and later reads reuse its result. Events
+referencing the same retained browser File share its storage and quota reservation.
+The browser sends up to four requested files concurrently per connection. Other UI
+events continue to run during transfers.
 
-Omitted settings keep their defaults. A file's declared size counts toward the cap
-from registration until its last `FileData` handle or reader is dropped. Every file,
-including an empty file, also reserves one slot in the connection's file-count limit.
-Dropping the last handle deletes the temporary file and releases both reservations.
-Canceled and failed uploads also clean up their temporary files. Each connection
+A file handle owns the selected browser File independently of its input. Removing or
+replacing the input does not invalidate a retained handle or cancel its active readers.
+Dropping all handles and readers releases the browser reference, cancels an unfinished
+transfer, deletes any temporary file, and releases its quota. Disconnecting cancels
+unfinished transfers; already downloaded files remain readable while retained.
+
+Omitted settings keep their defaults. A file's declared size and one file slot count
+toward the connection's limits from creation of its handle, including unread and
+zero-byte files. Handles that exceed either limit still expose metadata, but reads
+return the quota error. Failed transfers release their reservations. Each connection
 has its own budget; the pool does not identify accounts across connections.
 
-The timeout releases unused upload reservations without waiting for another
-upload. Once a batch starts uploading, it remains valid until completion or
-cancellation. Files retained by the app remain available until released.
+The timeout starts when a read requests the transfer, so an unread selection can be
+retained until submission. An expired request releases its reservation and reports an
+error to its readers. Once HTTP uploading starts, it remains valid until completion
+or cancellation. A handle caches either the completed file or the transfer error.
 
-`FileData::byte_stream()` reads the temporary file in bounded chunks. `read_bytes()`
-and `read_string()` load its contents into memory only when the app requests them.
-`name()` preserves the browser's filename; `path()` returns the server's temporary
-path after an upload. Metadata-only events do not expose the browser-supplied name
-as a server path. Keep a `FileData` handle alive while using a temporary path.
+`FileData::byte_stream()` starts the transfer on its first poll, waits for the complete
+temporary file, then reads it in bounded chunks. `read_bytes()` and `read_string()`
+load the downloaded contents into memory. `name()` preserves the browser's filename;
+`path()` is empty until the transfer completes successfully, then returns the
+server's temporary path. Keep a `FileData` handle alive while using that path. Browser-supplied paths
+are never treated as server filesystem paths.
+
+`FormData::parsed_values()` preserves the original handles for `FileData` fields,
+including lazy reads, filenames, and quota ownership after the form event is dropped.
+Parsing into `SerializedFileData` keeps metadata only. Schemas that buffer metadata,
+such as untagged enums, must distinguish the files; ambiguous metadata returns a
+parsing error instead of selecting another file.
 
 If you construct your own `VirtualDom`, call `view.run(vdom, socket).await` on your
 local executor and pass `view.clone()` to `axum_file_upload`. Both handlers must use
-the same pool to share upload credentials and temporary files. The standalone `run` function
-is deprecated because its upload registry is inaccessible to the HTTP handler.
+the same pool to share upload credentials and temporary files.
 
 ### Cross-origin WebSocket URLs
 

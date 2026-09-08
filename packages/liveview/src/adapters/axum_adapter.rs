@@ -169,9 +169,10 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_releases_a_stalled_http_upload() {
-        let view = LiveViewPool::new().with_upload_limit(3);
+        let view = LiveViewPool::new().with_upload_storage_limit(3);
         let session = view.uploads.new_session();
-        let tokens = view.uploads.register(&session, &[3]).unwrap();
+        let reservation = view.uploads.reserve(&session, 3).unwrap();
+        let token = view.uploads.register_reserved(reservation);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let body = futures_util::stream::once(async move {
             let _ = started_tx.send(());
@@ -180,7 +181,7 @@ mod tests {
         .chain(futures_util::stream::pending());
         let request = Request::builder()
             .method("PUT")
-            .uri(format!("/upload/{}", tokens[0]))
+            .uri(format!("/upload/{}", token))
             .header("X-Content-Size", "3")
             .body(Body::from_stream(body))
             .unwrap();
@@ -188,10 +189,10 @@ mod tests {
         let response = tokio::spawn(router.oneshot(request));
         started_rx.await.unwrap();
         assert_eq!(
-            view.uploads.register(&session, &[1]),
-            Err(crate::upload::UploadError::LimitExceeded)
+            view.uploads.reserve(&session, 1).err(),
+            Some(crate::upload::UploadError::LimitExceeded)
         );
-        view.uploads.cancel(&tokens);
+        view.uploads.cancel(&token);
 
         let response = tokio::time::timeout(Duration::from_secs(1), response)
             .await
@@ -199,6 +200,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(response.status(), StatusCode::GONE);
-        assert!(view.uploads.register(&session, &[3]).is_ok());
+        assert!(view.uploads.reserve(&session, 3).is_ok());
     }
 }

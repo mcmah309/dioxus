@@ -107,6 +107,8 @@ pub use serialize::*;
 #[cfg(feature = "serialize")]
 mod serialize {
     use super::*;
+    use serde::Deserialize;
+    use std::cell::RefCell;
 
     /// A serializable representation of file metadata
     #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Clone)]
@@ -228,13 +230,78 @@ mod serialize {
         }
     }
 
+    pub(crate) const FILE_DATA_NEWTYPE: &str = "$dioxus::FileData";
+
+    thread_local! {
+        static FORM_FILES: RefCell<Vec<(FileData, SerializedFileData)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    // Serde's visitors only carry data-model values. During synchronous form parsing, the
+    // private FileData newtype transports an index into these handles instead of a raw path.
+    // Restore the previous context on errors, panics, and nested calls to parsed_values().
+    pub(crate) fn with_form_files<T>(
+        files: Vec<(FileData, SerializedFileData)>,
+        parse: impl FnOnce() -> T,
+    ) -> T {
+        struct RestoreFiles(Vec<(FileData, SerializedFileData)>);
+        impl Drop for RestoreFiles {
+            fn drop(&mut self) {
+                FORM_FILES.set(std::mem::take(&mut self.0));
+            }
+        }
+        let _restore = RestoreFiles(FORM_FILES.replace(files));
+        parse()
+    }
+
     impl<'de> serde::Deserialize<'de> for FileData {
         fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
         where
             D: serde::Deserializer<'de>,
         {
-            let sfd = SerializedFileData::deserialize(deserializer)?;
-            Ok(FileData::new(sfd))
+            struct FileVisitor;
+            impl<'de> serde::de::Visitor<'de> for FileVisitor {
+                type Value = FileData;
+
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("file metadata or an owned form file")
+                }
+
+                fn visit_u64<E: serde::de::Error>(self, index: u64) -> Result<FileData, E> {
+                    FORM_FILES.with(|files| {
+                        usize::try_from(index)
+                            .ok()
+                            .and_then(|index| {
+                                files.borrow().get(index).map(|(file, _)| file.clone())
+                            })
+                            .ok_or_else(|| E::custom("form file is no longer available"))
+                    })
+                }
+
+                fn visit_newtype_struct<D: serde::Deserializer<'de>>(
+                    self,
+                    deserializer: D,
+                ) -> Result<FileData, D::Error> {
+                    let metadata = SerializedFileData::deserialize(deserializer)?;
+                    // Untagged enums may buffer metadata before invoking this visitor. Match
+                    // the snapshot captured before parsing: a lazy file's path can change when
+                    // a concurrent read finishes. Unread files can have identical metadata, so
+                    // reject ambiguity instead of returning a different file's handle.
+                    FORM_FILES.with(|files| {
+                        let files = files.borrow();
+                        let mut matches = files.iter().filter(|(_, snapshot)| *snapshot == metadata);
+                        let Some((file, _)) = matches.next() else {
+                            return Ok(FileData::new(metadata));
+                        };
+                        if matches.any(|(other, _)| !std::sync::Arc::ptr_eq(&file.inner, &other.inner)) {
+                            return Err(serde::de::Error::custom(
+                                "buffered file metadata is ambiguous; deserialize FileData fields directly",
+                            ));
+                        }
+                        Ok(file.clone())
+                    })
+                }
+            }
+            deserializer.deserialize_newtype_struct(FILE_DATA_NEWTYPE, FileVisitor)
         }
     }
 }

@@ -4,6 +4,10 @@ use std::fmt::Debug;
 
 use dioxus_core::Event;
 
+#[cfg(feature = "serialize")]
+#[path = "form/deserialize.rs"]
+mod deserialize;
+
 pub type FormEvent = Event<FormData>;
 
 /* DOMEvent:  Send + SyncTarget relatedTarget */
@@ -81,61 +85,15 @@ impl FormData {
 
 impl FormData {
     /// Parse the values into a struct with one field per value
+    ///
+    /// Fields of type [`FileData`] retain the original file, including its contents and
+    /// any temporary-file ownership, independently of this event.
     #[cfg(feature = "serialize")]
     pub fn parsed_values<T>(&self) -> Result<T, serde_json::Error>
     where
         T: serde::de::DeserializeOwned,
     {
-        use crate::SerializedFileData;
-
-        let values = &self.values();
-
-        let mut map = serde_json::Map::new();
-        for (key, value) in values {
-            let entry = map
-                .entry(key.clone())
-                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-
-            match value {
-                FormValue::Text(text) => {
-                    entry
-                        .as_array_mut()
-                        .expect("entry should be an array")
-                        .push(serde_json::Value::String(text.clone()));
-                }
-                // we create the serialized variant with no bytes
-                // SerializedFileData, if given a real path, will read the bytes from disk (synchronously)
-                FormValue::File(Some(file_data)) => {
-                    let serialized = SerializedFileData::from_file_data(file_data);
-                    entry
-                        .as_array_mut()
-                        .expect("entry should be an array")
-                        .push(serde_json::to_value(&serialized).unwrap_or(serde_json::Value::Null));
-                }
-                FormValue::File(None) => {
-                    entry
-                        .as_array_mut()
-                        .expect("entry should be an array")
-                        .push(
-                            serde_json::to_value(SerializedFileData::empty())
-                                .unwrap_or(serde_json::Value::Null),
-                        );
-                }
-            }
-        }
-
-        // Go through the map and convert single-element arrays to just the element
-        let map = map
-            .into_iter()
-            .map(|(k, v)| match v {
-                serde_json::Value::Array(arr) if arr.len() == 1 => {
-                    (k, arr.into_iter().next().unwrap())
-                }
-                _ => (k, v),
-            })
-            .collect::<serde_json::Map<String, serde_json::Value>>();
-
-        serde_json::from_value(serde_json::Value::Object(map))
+        deserialize::from_values(self.values())
     }
 }
 

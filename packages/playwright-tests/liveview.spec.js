@@ -124,8 +124,8 @@ for (const id of ["file-picker", "form-file-picker"]) {
     const events = messages
       .filter((message) => message !== "__ping__")
       .map((message) => JSON.parse(message))
-      .filter((message) => message.method === "user_event" || message.method === "file_upload")
-      .map((message) => message.method === "file_upload" ? message.params.event.name : message.params.name);
+      .filter((message) => message.method === "user_event" || message.method === "file_event")
+      .map((message) => message.method === "file_event" ? message.params.event.name : message.params.name);
     expect(events).toEqual(["input", "change"]);
 
     if (id === "form-file-picker") {
@@ -171,7 +171,7 @@ test("multiple files, including a large file, upload over HTTP", async ({ page }
       expect(typeof payload).toBe("string");
       if (payload.startsWith("{")) {
         const message = JSON.parse(payload);
-        if (message.method === "file_upload") uploadMetadata = message.params;
+        if (message.method === "file_event") uploadMetadata = message.params;
       }
     });
     socket.on("close", () => { closed = true; });
@@ -233,7 +233,7 @@ test("file uploads work with a cross-origin absolute WebSocket URL", async ({ pa
   await page.goto("http://localhost:3030");
   await expect(page.locator(".onmounted-div")).toHaveText("onmounted was called 1 times");
 
-  const credentials = await page.evaluate(() => {
+  await page.evaluate(() => {
     const originalFetch = window.fetch;
     let uploadCredentials;
     window.fetch = (input, init) => {
@@ -242,7 +242,6 @@ test("file uploads work with a cross-origin absolute WebSocket URL", async ({ pa
     };
     Object.assign(window, { uploadCredentials: () => uploadCredentials });
   });
-  expect(credentials).toBeUndefined();
 
   await page.locator("#large-file-picker").setInputFiles({
     name: "cross-origin.bin",
@@ -254,23 +253,26 @@ test("file uploads work with a cross-origin absolute WebSocket URL", async ({ pa
 });
 
 test("retained files count toward only their connection's upload cap", async ({ page, context }) => {
-  async function reserve(page, size) {
-    return page.evaluate(async (size) => {
-      try {
-        const { id } = await window.ipc.beginFileUpload({
-          event: {
-            element: 0, name: "change", bubbles: true,
-            data: { values: [{ key: "file", file: {
-              path: "quota-probe.bin", size, last_modified: 0, content_type: "application/octet-stream",
-            } }] },
-          },
-        });
-        window.ipc.cancelFileUpload(id);
-        return "accepted";
-      } catch (error) {
-        return error.message;
-      }
-    }, size);
+  let sequence = 0;
+  async function probe(page, size) {
+    const name = `quota-probe-${sequence++}.bin`;
+    const requests = [];
+    const track = (request) => {
+      if (request.url().includes("/ws/upload/")) requests.push(request);
+    };
+    page.on("request", track);
+    await page.locator("#file-picker").evaluate((input, { size, name }) => {
+      const files = new DataTransfer();
+      files.items.add(new File(["x"], name));
+      input.files = files.files;
+      // Exercise reservations without allocating a gigabyte. Accepted reads fail the HTTP
+      // size check, while rejected handles report the quota error before sending bytes.
+      Object.defineProperty(input.files[0], "size", { value: size });
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    }, { size, name });
+    await expect(page.locator("#file-picker-change")).toContainText(name);
+    page.off("request", track);
+    return { requests: requests.length, message: await page.locator("#file-picker-change").textContent() };
   }
 
   await page.goto("http://127.0.0.1:3030");
@@ -279,29 +281,26 @@ test("retained files count toward only their connection's upload cap", async ({ 
   });
   await expect(page.locator("#retained-files")).toHaveText("1");
   const limit = 1024 * 1024 * 1024;
-  expect(await reserve(page, limit - 3)).toBe("accepted");
-  expect(await reserve(page, limit - 2)).toContain("upload data limit");
+  expect((await probe(page, limit - 3)).requests).toBe(1);
+  const rejected = await probe(page, limit - 2);
+  expect(rejected.requests).toBe(0);
+  expect(rejected.message).toContain("upload data limit");
 
   const other = await context.newPage();
   await other.goto("http://127.0.0.1:3030");
   await expect(other.locator(".onmounted-div")).toHaveText("onmounted was called 1 times");
-  expect(await reserve(other, limit)).toBe("accepted");
+  expect((await probe(other, limit)).requests).toBe(1);
   await other.close();
 
   await page.getByRole("button", { name: "Release files" }).click();
   await expect(page.locator("#retained-files")).toHaveText("0");
-  expect(await reserve(page, limit)).toBe("accepted");
+  expect((await probe(page, limit)).requests).toBe(1);
 });
 
 test("a rejected upload leaves the connection usable for events and uploads", async ({ page }) => {
-  /** @type {string[]} */
-  const errors = [];
   /** @type {Error[]} */
   const unhandled = [];
   let closed = false;
-  page.on("console", (message) => {
-    if (message.type() === "error") errors.push(message.text());
-  });
   page.on("pageerror", (error) => unhandled.push(error));
   page.on("websocket", (socket) => {
     socket.on("close", () => { closed = true; });
@@ -318,8 +317,7 @@ test("a rejected upload leaves the connection usable for events and uploads", as
     input.dispatchEvent(new Event("change", { bubbles: true }));
   });
 
-  await expect.poll(() => errors.join("\n")).toContain("exceeds the connection's upload data limit");
-  await expect(page.locator("#large-upload")).toHaveText("");
+  await expect(page.locator("#large-upload")).toContainText("exceeds the connection's upload data limit");
   await page.getByRole("button", { name: "Increment" }).click();
   await expect(page.locator("#main")).toContainText("hello axum! 1");
   await picker.setInputFiles({
@@ -331,14 +329,9 @@ test("a rejected upload leaves the connection usable for events and uploads", as
 });
 
 test("invalid upload metadata does not block subsequent events or uploads", async ({ page }) => {
-  /** @type {string[]} */
-  const errors = [];
   /** @type {Error[]} */
   const unhandled = [];
   let closed = false;
-  page.on("console", (message) => {
-    if (message.type() === "error") errors.push(message.text());
-  });
   page.on("pageerror", (error) => unhandled.push(error));
   page.on("websocket", (socket) => {
     socket.on("close", () => { closed = true; });
@@ -355,10 +348,10 @@ test("invalid upload metadata does not block subsequent events or uploads", asyn
   });
   await page.getByRole("button", { name: "Increment" }).click();
 
-  await expect.poll(() => errors.join("\n")).toContain("invalid file upload metadata");
+  await expect.poll(() => page.evaluate(() => window.ipc.files.size)).toBe(0);
   await expect(page.locator("#large-upload")).toHaveText("");
   await expect(page.locator("#main")).toContainText("hello axum! 1");
-  expect(await page.evaluate(() => window.ipc.pendingFileUploads.size)).toBe(0);
+  expect(await page.evaluate(() => window.ipc.activeFileUploads.size)).toBe(0);
   await picker.setInputFiles({
     name: "retry.bin", mimeType: "application/octet-stream", buffer: Buffer.from([42]),
   });
@@ -376,7 +369,7 @@ test("text edits and a later upload proceed while an earlier upload is stalled",
       if (!text.startsWith("{")) return;
       const message = JSON.parse(text);
       if (message.method === "user_event") events.push(message.params);
-      if (message.method === "file_upload") events.push(message.params.event);
+      if (message.method === "file_event") events.push(message.params.event);
     });
   });
   await page.goto("http://127.0.0.1:3030");
@@ -393,9 +386,9 @@ test("text edits and a later upload proceed while an earlier upload is stalled",
       fileUploadCount: () => uploads,
       releaseFileUpload: () => release(),
     });
-    window.ipc.uploadFile = async function (token, file) {
+    window.ipc.uploadFile = async function (token, file, signal) {
       if (++uploads === 1) await gate;
-      return original(token, file);
+      return original(token, file, signal);
     };
 
     const picker = /** @type {HTMLInputElement} */ (document.querySelector("#form-file-picker"));
@@ -412,7 +405,7 @@ test("text edits and a later upload proceed while an earlier upload is stalled",
     }
   });
   await expect(page.locator("#description-values")).toHaveText("a,ab,abc");
-  await expect(page.locator("#form-file-picker-counts")).toHaveText("0,1");
+  await expect(page.locator("#form-file-picker-counts")).toHaveText("0,2");
   await expect(page.locator("#form-file-picker-change")).toContainText("ab.txt|2|text/plain|");
   await expect(page.locator("#form-file-picker-change")).toContainText("[97, 98]");
   expect(events.map(({ name }) => name)).toEqual(["change", "input", "change", "input", "input"]);
@@ -530,25 +523,24 @@ test("a failed HTTP upload does not block subsequent events", async ({ page }) =
   });
   await page.locator('input[name="description"]').fill("still responsive");
   await expect(page.locator("#description-values")).toHaveText("still responsive");
-  expect(errors.filter((message) => message.includes("Failed to send LiveView event"))).toHaveLength(2);
+  await expect(page.locator("#form-file-picker-input")).toContainText("ERROR: Error: Upload unavailable");
+  await expect(page.locator("#form-file-picker-change")).toContainText("ERROR: Error: Upload unavailable");
+  expect(errors.filter((message) => message.includes("Failed to send LiveView event"))).toHaveLength(0);
   expect(unhandled).toEqual([]);
 });
 
-test("upload completion acknowledgments do not block other uploads or events", async ({ page }) => {
+test("a delayed upload completion does not block other events", async ({ page }) => {
   await page.goto("http://127.0.0.1:3030");
   await expect(page.locator(".onmounted-div")).toHaveText("onmounted was called 1 times");
   await page.evaluate(() => {
-    const ws = window.ipc.ws;
-    const onmessage = ws.onmessage;
+    const send = window.ipc.postMessage.bind(window.ipc);
     let held = false;
-    ws.onmessage = (message) => {
-      const bytes = new Uint8Array(message.data);
-      if (!held && bytes[0] === 0 &&
-          new TextDecoder().decode(bytes.slice(1)).includes('"file_upload_complete"')) {
+    window.ipc.postMessage = (message) => {
+      if (!held && JSON.parse(message).method === "file_upload_complete") {
         held = true;
-        Object.assign(window, { releaseUploadCompletion: () => onmessage(message) });
+        Object.assign(window, { releaseUploadCompletion: () => send(message) });
       } else {
-        onmessage(message);
+        send(message);
       }
     };
   });
@@ -557,15 +549,17 @@ test("upload completion acknowledgments do not block other uploads or events", a
   });
   await expect.poll(() => page.evaluate(() => typeof window.releaseUploadCompletion)).toBe("function");
   await expect(page.locator("#file-picker-counts")).toHaveText("1,1");
-  await expect.poll(() => page.evaluate(() => window.ipc.pendingFileUploads.size)).toBe(1);
+  await expect(page.locator("#file-picker-input")).toHaveText("");
+  await expect(page.locator("#file-picker-change")).toHaveText("");
   await page.getByRole("button", { name: "Increment" }).click();
   await expect(page.locator("#main")).toContainText("hello axum! 1");
 
   await page.evaluate(() => window.releaseUploadCompletion());
-  await expect.poll(() => page.evaluate(() => window.ipc.pendingFileUploads.size)).toBe(0);
+  await expect(page.locator("#file-picker-input")).toContainText("[104, 101, 108, 108, 111]");
+  await expect(page.locator("#file-picker-change")).toContainText("[104, 101, 108, 108, 111]");
 });
 
-test("upload registration responses can arrive out of order", async ({ page }) => {
+test("file read requests can arrive out of order", async ({ page }) => {
   const unhandled = [];
   page.on("pageerror", (error) => unhandled.push(error));
   await page.goto("http://127.0.0.1:3030");
@@ -579,81 +573,54 @@ test("upload registration responses can arrive out of order", async ({ page }) =
       if (!held && bytes[0] === 0 &&
           new TextDecoder().decode(bytes.slice(1)).includes('"type":"file_upload"')) {
         held = true;
-        Object.assign(window, { releaseUploadRegistration: () => onmessage(message) });
+        Object.assign(window, { releaseFileRequest: () => onmessage(message) });
       } else {
         onmessage(message);
       }
     };
   });
-  await page.locator("#file-picker").setInputFiles({
-    name: "hello.txt", mimeType: "text/plain", buffer: Buffer.from("hello"),
-  });
-  await expect(page.locator("#file-picker-counts")).toHaveText("0,1");
-  await expect(page.locator("#file-picker-text")).toHaveText("hello");
-  expect(await page.evaluate(() => window.ipc.pendingFileUploads.size)).toBe(1);
-
-  await page.evaluate(() => window.releaseUploadRegistration());
-  await expect(page.locator("#file-picker-counts")).toHaveText("1,1");
-  await expect(page.locator("#file-picker-input")).toContainText("[104, 101, 108, 108, 111]");
-  expect(await page.evaluate(() => window.ipc.pendingFileUploads.size)).toBe(0);
+  const picker = page.locator("#large-file-picker");
+  await picker.setInputFiles({ name: "slow.bin", mimeType: "application/octet-stream", buffer: Buffer.from([1]) });
+  await expect.poll(() => page.evaluate(() => typeof window.releaseFileRequest)).toBe("function");
+  await picker.setInputFiles({ name: "fast.bin", mimeType: "application/octet-stream", buffer: Buffer.from([2]) });
+  await expect(page.locator("#large-upload")).toHaveText("fast.bin|1|2|2");
+  await page.evaluate(() => window.releaseFileRequest());
+  await expect(page.locator("#large-upload")).toHaveText("slow.bin|1|1|1");
+  await expect.poll(() => page.evaluate(() => window.ipc.activeFileUploads.size)).toBe(0);
   expect(unhandled).toEqual([]);
 });
 
-test("concurrent batches share the default connection quota and cancel independently", async ({ page }) => {
+test("selection and submission retain unread files without uploading them", async ({ page }) => {
+  const uploads = [];
+  page.on("request", (request) => {
+    if (request.url().includes("/ws/upload/")) uploads.push(request);
+  });
   await page.goto("http://127.0.0.1:3030");
-  await expect(page.locator(".onmounted-div")).toHaveText("onmounted was called 1 times");
-  const result = await page.evaluate(async () => {
-    const limit = 1024 * 1024 * 1024;
-    async function reserve(size) {
-      try {
-        return await window.ipc.beginFileUpload({
-          event: {
-            element: 0, name: "change", bubbles: true,
-            data: { values: [{ key: "file", file: {
-              path: "quota.bin", size, last_modified: 0, content_type: "application/octet-stream",
-            } }] },
-          },
-        });
-      } catch (error) {
-        return { error: error.message };
-      }
-    }
-    // Reserve real server quota without allocating a gigabyte in the browser.
-    const batches = await Promise.all([reserve(limit * 3 / 4), reserve(limit / 4), reserve(1)]);
-    window.ipc.cancelFileUpload(batches[0].id);
-    const replacement = await reserve(limit * 3 / 4);
-    const stillFull = await reserve(1);
-    window.ipc.cancelFileUpload(batches[1].id);
-    window.ipc.cancelFileUpload(replacement.id);
-    const wholeLimit = await reserve(limit);
-    window.ipc.cancelFileUpload(wholeLimit.id);
-    return { batches, replacement, stillFull, wholeLimit };
+  await page.locator("#retained-file-picker").setInputFiles({
+    name: "unread.txt", mimeType: "text/plain", buffer: Buffer.from("hello"),
   });
-  expect(result.batches[0].tokens).toHaveLength(1);
-  expect(result.batches[1].tokens).toHaveLength(1);
-  expect(result.batches[0].id).not.toBe(result.batches[1].id);
-  expect(result.batches[2].error).toContain("upload data limit");
-  expect(result.replacement.tokens).toHaveLength(1);
-  expect(result.stillFull.error).toContain("upload data limit");
-  expect(result.wholeLimit.tokens).toHaveLength(1);
-
-  await page.locator("#large-file-picker").setInputFiles({
-    name: "retry.bin", mimeType: "application/octet-stream", buffer: Buffer.from([42]),
-  });
-  await expect(page.locator("#large-upload")).toHaveText("retry.bin|1|42|42");
+  await expect(page.locator("#retained-files")).toHaveText("1");
+  await page.locator("#retained-form").dispatchEvent("submit");
+  await page.getByRole("button", { name: "Increment" }).click();
+  await expect(page.locator("#main")).toContainText("hello axum! 1");
+  expect(uploads).toEqual([]);
+  expect(await page.evaluate(() => window.ipc.files.size)).toBe(1);
+  await page.getByRole("button", { name: "Release files" }).click();
+  await expect(page.locator("#retained-files")).toHaveText("0");
+  await expect.poll(() => page.evaluate(() => window.ipc.files.size)).toBe(0);
 });
 
-// Associate HTTP requests with filenames using the upload metadata and returned tokens.
+// Resolve HTTP tokens through the browser file IDs carried by the event.
 function trackUploadNames(page) {
   const namesByToken = new Map();
   page.on("websocket", (socket) => {
-    const batches = new Map();
+    const namesById = new Map();
     socket.on("framesent", ({ payload }) => {
       if (typeof payload !== "string" || !payload.startsWith("{")) return;
       const message = JSON.parse(payload);
-      if (message.method === "file_upload") {
-        batches.set(message.params.id, message.params.event.data.values
-          .filter((value) => value.file).map((value) => value.file.path));
+      if (message.method === "file_event") {
+        const names = message.params.event.data.values.filter((value) => value.file).map((value) => value.file.path);
+        message.params.file_ids.forEach((id, index) => namesById.set(id, names[index]));
       }
     });
     socket.on("framereceived", ({ payload }) => {
@@ -662,21 +629,23 @@ function trackUploadNames(page) {
       if (!text.startsWith("{")) return;
       const message = JSON.parse(text);
       if (message.type === "file_upload") {
-        const names = batches.get(message.data.id);
-        message.data.tokens.forEach((token, index) => namesByToken.set(token, names[index]));
-        batches.delete(message.data.id);
+        namesByToken.set(message.data.token, namesById.get(message.data.id));
       }
     });
   });
   return (request) => namesByToken.get(new URL(request.url()).pathname.split("/").pop());
 }
 
-test("a failed batch does not cancel another concurrent upload", async ({ page }) => {
+test("a failed file does not cancel another concurrent upload", async ({ page }) => {
   const uploadName = trackUploadNames(page);
   const errors = [];
   const unhandled = [];
-  page.on("console", (message) => {
-    if (message.type() === "error") errors.push(message.text());
+  page.on("websocket", (socket) => {
+    socket.on("framesent", ({ payload }) => {
+      if (typeof payload !== "string" || !payload.startsWith("{")) return;
+      const message = JSON.parse(payload);
+      if (message.method === "file_upload_error") errors.push(message.params.error);
+    });
   });
   page.on("pageerror", (error) => unhandled.push(error));
   let stalled;
@@ -707,10 +676,10 @@ test("a failed batch does not cancel another concurrent upload", async ({ page }
   await stalled.continue();
   await expect(page.locator("#large-upload")).toHaveText("slow.bin|1|42|42");
   expect(unhandled).toEqual([]);
-  expect(await page.evaluate(() => window.ipc.pendingFileUploads.size)).toBe(0);
+  expect(await page.evaluate(() => window.ipc.activeFileUploads.size)).toBe(0);
 });
 
-test("files within a batch upload concurrently and preserve their metadata order", async ({ page }) => {
+test("files upload as each stream is read and preserve their metadata order", async ({ page }) => {
   const uploadName = trackUploadNames(page);
   let stalled;
   let completed = 0;
@@ -732,74 +701,53 @@ test("files within a batch upload concurrently and preserve their metadata order
     input.files = files.files;
     input.dispatchEvent(new Event("change", { bubbles: true }));
   });
-  await expect.poll(() => completed).toBe(1);
+  await expect.poll(() => Boolean(stalled)).toBe(true);
+  await page.getByRole("button", { name: "Increment" }).click();
+  await expect(page.locator("#main")).toContainText("hello axum! 1");
+  expect(completed).toBe(0);
   await expect(page.locator("#large-upload")).toHaveText("");
   await stalled.continue();
   await expect(page.locator("#large-upload")).toHaveText("slow.bin|1|42|42\nfast.bin|2|128|255");
 });
 
-test("closing the websocket rejects every pending upload request", async ({ page }) => {
+test("closing the websocket cancels active and queued file reads", async ({ page }) => {
+  const unhandled = [];
+  page.on("pageerror", (error) => unhandled.push(error));
   await page.goto("http://127.0.0.1:3030");
   await expect(page.locator(".onmounted-div")).toHaveText("onmounted was called 1 times");
-  const result = await page.evaluate(async () => {
-    const ws = window.ipc.ws;
-    // Hold the responses so both promises are still pending when the connection closes.
-    ws.onmessage = () => {};
-    const requests = [window.ipc.beginFileUpload({}), window.ipc.beginFileUpload({})];
-    const pending = window.ipc.pendingFileUploads.size;
-    const results = Promise.allSettled(requests);
-    ws.close();
-    return { pending, errors: (await results).map((result) => result.reason.message), remaining: window.ipc.pendingFileUploads.size };
-  });
-  expect(result.pending).toBe(2);
-  expect(result.errors).toEqual([
-    "LiveView websocket closed during a file upload",
-    "LiveView websocket closed during a file upload",
-  ]);
-  expect(result.remaining).toBe(0);
-});
-
-test("a batch failure aborts its active requests and stops queued files", async ({ page }) => {
-  const uploadName = trackUploadNames(page);
-  const stalled = [];
-  const aborted = [];
-  const unhandled = [];
-  let queued = false;
-  let releaseFailure;
-  const failureGate = new Promise((resolve) => { releaseFailure = resolve; });
-  page.on("pageerror", (error) => unhandled.push(error));
-  page.on("requestfailed", (request) => {
-    if (uploadName(request)?.startsWith("slow")) aborted.push(request);
-  });
-  await page.route("**/ws/upload/*", async (route) => {
-    const name = uploadName(route.request());
-    if (name.includes("slow")) {
-      stalled.push(route);
-      if (stalled.length === 3) releaseFailure();
-    } else if (name.includes("failed.bin")) {
-      await failureGate;
-      await route.fulfill({ status: 500 });
-    } else {
-      if (name.includes("queued.bin")) queued = true;
-      await route.continue();
+  await page.evaluate(() => {
+    const started = [], aborted = [];
+    const fetch = window.fetch;
+    Object.assign(window, { uploadActivity: { started, aborted } });
+    window.fetch = (url, options) => {
+      if (!String(url).includes("/ws/upload/")) return fetch(url, options);
+      started.push(options.body.name);
+      return new Promise((_, reject) => {
+        options.signal.addEventListener("abort", () => {
+          aborted.push(options.body.name);
+          reject(options.signal.reason);
+        }, { once: true });
+      });
+    };
+    const picker = document.querySelector("#large-file-picker");
+    for (let index = 0; index < 5; index++) {
+      const files = new DataTransfer();
+      files.items.add(new File(["x"], `file-${index}.bin`));
+      picker.files = files.files;
+      picker.dispatchEvent(new Event("change", { bubbles: true }));
     }
   });
-  await page.goto("http://127.0.0.1:3030");
-  await page.locator("#large-file-picker").evaluate((input) => {
-    const files = new DataTransfer();
-    for (const name of ["slow1.bin", "slow2.bin", "slow3.bin", "failed.bin", "queued.bin"]) {
-      files.items.add(new File(["x"], name, { type: "application/octet-stream" }));
-    }
-    input.files = files.files;
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-  });
-  await expect.poll(() => aborted.length).toBe(3);
-  expect(queued).toBe(false);
-  await expect(page.locator("#large-upload")).toHaveText("");
-  await page.locator("#large-file-picker").setInputFiles({
-    name: "retry.bin", mimeType: "application/octet-stream", buffer: Buffer.from([42]),
-  });
-  await expect(page.locator("#large-upload")).toHaveText("retry.bin|1|42|42");
+  await expect.poll(() => page.evaluate(() => window.uploadActivity.started.length)).toBe(4);
+  await expect.poll(() => page.evaluate(() => window.ipc.fileUploadQueue.length)).toBe(1);
+  await page.evaluate(() => window.ipc.ws.close());
+  await expect.poll(() => page.evaluate(() => window.uploadActivity.aborted.length)).toBe(4);
+  await expect.poll(() => page.evaluate(() => window.ipc.runningFileUploads)).toBe(0);
+  expect(await page.evaluate(() => ({
+    started: window.uploadActivity.started.length,
+    active: window.ipc.activeFileUploads.size,
+    queued: window.ipc.fileUploadQueue.length,
+    retained: window.ipc.files.size,
+  }))).toEqual({ started: 4, active: 0, queued: 0, retained: 0 });
   expect(unhandled).toEqual([]);
 });
 
@@ -825,18 +773,19 @@ for (const status of [200, 204]) {
     const picker = page.locator("#file-picker");
     const file = { name: "hello.txt", mimeType: "text/plain", buffer: Buffer.from("hello") };
     await picker.setInputFiles(file);
-    await expect.poll(() => errors.filter((message) => message.includes("HTTP upload handler")).length).toBe(2);
-    await expect(page.locator("#file-picker-counts")).toHaveText("0,0");
+    await expect(page.locator("#file-picker-input")).toContainText("HTTP upload handler");
+    await expect(page.locator("#file-picker-change")).toContainText("HTTP upload handler");
+    await expect(page.locator("#file-picker-counts")).toHaveText("1,1");
     await page.getByRole("button", { name: "Increment" }).click();
     await expect(page.locator("#main")).toContainText("hello axum! 1");
 
     await page.unroute("**/ws/upload/*");
     await picker.setInputFiles(file);
     await expect(page.locator("#file-picker-text")).toHaveText("hello");
-    await expect(page.locator("#file-picker-counts")).toHaveText("1,1");
+    await expect(page.locator("#file-picker-counts")).toHaveText("2,2");
     expect(closed).toBe(false);
     expect(unhandled).toEqual([]);
-    expect(errors).toHaveLength(2);
+    expect(errors).toHaveLength(0);
   });
 }
 

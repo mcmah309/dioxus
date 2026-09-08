@@ -14,7 +14,8 @@ export type SerializedEvent = {
 
 export function serializeEvent(
   event: Event,
-  target: EventTarget
+  target: EventTarget,
+  files: File[] = []
 ): SerializedEvent {
   let contents = {};
 
@@ -32,7 +33,7 @@ export function serializeEvent(
   }
 
   if (event instanceof InputEvent) {
-    extend(serializeInputEvent(event, target));
+    extend(serializeInputEvent(event, target, files));
     if (event.type === "beforeinput") {
       extend({
         input_type: event.inputType,
@@ -93,14 +94,14 @@ export function serializeEvent(
     extend(serializeTouchEvent(event));
   }
 
-  if (
+  if (!(event instanceof InputEvent) && (
     event.type === "submit" ||
     event.type === "reset" ||
     event.type === "click" ||
     event.type === "change" ||
     event.type === "input"
-  ) {
-    extend(serializeInputEvent(event as InputEvent, target));
+  )) {
+    extend(serializeInputEvent(event as InputEvent, target, files));
   }
 
   // If there's any files, we need to serialize them
@@ -186,13 +187,14 @@ export function serializeIntersectionEventDetail(
 
 function serializeInputEvent(
   event: InputEvent,
-  target: EventTarget
+  target: EventTarget,
+  files: File[]
 ): SerializedEvent {
   let contents: SerializedEvent = {};
 
   // Attempt to retrieve the values from the form
   if (target instanceof HTMLElement) {
-    let values = extractSerializedFormValues(event, target);
+    let values = extractSerializedFormValues(event, target, files);
     contents.values = values.values;
     contents.valid = values.valid;
   }
@@ -490,54 +492,49 @@ export type SerializedFileData = {
   content_type?: string;
 };
 
-export function extractSerializedFormValues(event: Event, target: HTMLElement): SerializedFormData {
-  let contents: SerializedFormData = {
-    values: []
-  };
+export function extractSerializedFormValues(
+  event: Event,
+  target: HTMLElement,
+  files: File[] = []
+): SerializedFormData {
+  const values: SerializedFormObject[] = [];
+  if (!["input", "change", "submit", "reset", "click"].includes(event.type)) {
+    return { values };
+  }
 
-  // If there's a form...
-  let form = target.closest("form");
-
-  // If the target is an input, and the event is input or change, we want to get the value without going through the form
-  if (form) {
-    if (
-      event.type === "input"
-      || event.type === "change"
-      || event.type === "submit"
-      || event.type === "reset"
-      || event.type === "click"
-    ) {
-      contents = retrieveFormValues(form);
+  const form = target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement
+    ? target.form
+    : target.closest("form");
+  const entries = form ? Array.from(new FormData(form).entries()) : [];
+  if (target instanceof HTMLInputElement && target.type === "file" && (!form || !target.name)) {
+    for (const file of Array.from(target.files || [])) {
+      entries.push([target.name, file]);
+    }
+    if (!target.files?.length && target.name) {
+      values.push({ key: target.name });
     }
   }
 
-  return contents;
-}
-
-// todo: maybe encode spaces or something?
-// We encode select multiple as a comma separated list which breaks... when there's commas in the values
-function retrieveFormValues(form: HTMLFormElement): SerializedFormData {
-  const formData = new FormData(form);
-  const contents: SerializedFormObject[] = [];
-
-  formData.forEach((value, key) => {
-    if (value instanceof File) {
-      let fileData: SerializedFileData = {
-        path: value.name,
-        size: value.size,
-        last_modified: value.lastModified,
-        content_type: value.type,
-      };
-      contents.push({ key, file: fileData });
+  for (const [key, value] of entries) {
+    if (!(value instanceof File)) {
+      values.push({ key, text: value });
+    } else if (value.name === "" && value.size === 0) {
+      values.push({ key });
     } else {
-      contents.push({ key, text: value });
+      values.push({
+        key,
+        file: {
+          path: value.webkitRelativePath || value.name,
+          size: value.size,
+          last_modified: value.lastModified,
+          content_type: value.type,
+        },
+      });
+      files.push(value);
     }
-  });
-
-  return {
-    valid: form.checkValidity(),
-    values: contents
-  };
+  }
+  return { valid: form?.checkValidity(), values };
 }
 
 export function retrieveSelectValue(target: HTMLSelectElement): string[] {

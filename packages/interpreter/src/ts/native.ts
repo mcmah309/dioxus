@@ -179,11 +179,6 @@ export class NativeInterpreter extends JSChannel_ {
     });
   }
 
-  sendIpcMessage(method: string, params = {}) {
-    const body = JSON.stringify({ method, params });
-    this.ipc.postMessage(body);
-  }
-
   scrollTo(id: NodeId, options: ScrollIntoViewOptions): boolean {
     const node = this.nodes[id];
     if (node instanceof HTMLElement) {
@@ -332,61 +327,60 @@ export class NativeInterpreter extends JSChannel_ {
   handleEvent(event: Event, name: string, bubbles: boolean) {
     const target = event.target!;
     const element = getTargetId(target)!;
-    const contents = serializeEvent(event, target);
+    const files: File[] = [];
+    const contents = serializeEvent(event, target, files);
 
-    // Handle the event on the virtualdom and then preventDefault if it also preventsDefault
-    // Some listeners
-    let body = {
+    const body: SerializedHtmlEvent = {
       name,
       data: contents,
       element,
       bubbles,
     };
 
-    let formEntries: [string, FormDataEntryValue][] | undefined;
-    if (this.liveview) {
-      // Upload file contents for file-input and submit events.
-      // Other form events send file metadata only.
-      const shouldUploadFiles = target instanceof HTMLElement &&
-        (name === "submit" ||
-          (target instanceof HTMLInputElement && target.type === "file" &&
-            (name === "input" || name === "change")));
-      formEntries = shouldUploadFiles ? this.snapshotFormEntries(target) : undefined;
+    const response = this.sendSerializedEvent(body, files);
+    if (!response) {
+      return;
     }
 
-    const response = this.sendSerializedEvent(body, formEntries);
-    // capture/prevent default of the event if the virtualdom wants to
-    if (response) {
-      if (response.preventDefault) {
-        event.preventDefault();
-      } else {
-        // Attempt to intercept if the event is a click and the default action was not prevented
-        if (target instanceof Element && event.type === "click") {
-          this.handleClickNavigate(event, target);
-        }
-      }
+    if (response.preventDefault) {
+      event.preventDefault();
+    } else if (target instanceof Element && event.type === "click") {
+      this.handleClickNavigate(event, target);
+    }
 
-      if (response.stopPropagation) {
-        event.stopPropagation();
-      }
+    if (response.stopPropagation) {
+      event.stopPropagation();
     }
   }
 
-  sendSerializedEvent(body: {
-    name: string;
-    element: number;
-    data: any;
-    bubbles: boolean;
-  }, entries?: [string, FormDataEntryValue][]): EventSyncResult | void {
+  sendSerializedEvent(body: SerializedHtmlEvent, files: File[] = []): EventSyncResult | void {
     if (this.liveview) {
-      // Send each event independently so uploads don't block other events.
-      this.sendLiveviewEvent(body, entries).catch((error) => {
-        console.error("Failed to send LiveView event", error);
-      });
-    } else {
-      // Run the event handler on the virtualdom
-      return handleVirtualdomEventSync(this.eventsPath, JSON.stringify(body));
+      return this.sendLiveviewEvent(body, files);
     }
+
+    return handleVirtualdomEventSync(this.eventsPath, JSON.stringify(body));
+  }
+
+  private sendLiveviewEvent(body: SerializedHtmlEvent, files: File[]): void {
+    const isFormEvent = body.name === "submit" || body.name === "reset" ||
+      body.name === "input" || body.name === "change";
+    const fileIds = isFormEvent ? files.map((file) => this.ipc.retainFile(file)) : [];
+    try {
+      // Events arrive immediately; reading a retained FileData requests its bytes later.
+      if (fileIds.length > 0) {
+        this.sendIpcMessage("file_event", { event: body, file_ids: fileIds });
+      } else {
+        this.sendIpcMessage("user_event", body);
+      }
+    } catch (error) {
+      for (const id of fileIds) this.ipc.releaseFile(id);
+      console.error("Failed to send LiveView event", error);
+    }
+  }
+
+  sendIpcMessage(method: string, params = {}) {
+    const body = JSON.stringify({ method, params });
+    this.ipc.postMessage(body);
   }
 
   handleClickNavigate(event: Event, target: Element) {
@@ -501,113 +495,21 @@ export class NativeInterpreter extends JSChannel_ {
       sheet.href = `${url}?${queryParams}`;
     }
   }
-
-  private snapshotFormEntries(target: HTMLElement): [string, FormDataEntryValue][] {
-    const form = target instanceof HTMLInputElement
-      ? target.form
-      : target.closest("form");
-    const entries = form ? Array.from(new FormData(form).entries()) : [];
-    const shouldAppendInputFiles =
-    target instanceof HTMLInputElement && (!form || !target.name);
-    if (shouldAppendInputFiles) {
-      const files = Array.from(target.files || []);
-      for (const file of files) {
-        entries.push([target.name, file]);
-      }
-      if (files.length === 0 && target.name) {
-        entries.push([target.name, new File([], "")]);
-      }
-    }
-    return entries;
-  }
-
-  private async sendLiveviewEvent(
-    body: { name: string; element: number; data: any; bubbles: boolean },
-    formEntries?: [string, FormDataEntryValue][]
-  ): Promise<void> {
-    if (!formEntries) {
-      this.sendIpcMessage("user_event", body);
-      return;
-    }
-
-    const values: SerializedFormObject[] = [];
-    const files: File[] = [];
-
-    for (const [key, value] of formEntries) {
-      if (!(value instanceof File)) {
-        values.push({ key, text: value });
-        continue;
-      }
-
-      const isEmptyFileSelection = value.name === "" && value.size === 0;
-      if (isEmptyFileSelection) {
-        values.push({ key });
-        continue;
-      }
-
-      values.push({
-        key,
-        file: {
-          path: value.webkitRelativePath || value.name,
-          size: value.size,
-          last_modified: value.lastModified,
-          content_type: value.type,
-        },
-      });
-      files.push(value);
-    }
-
-    body.data.values = values;
-    if (files.length === 0) {
-      this.sendIpcMessage("user_event", body);
-      return;
-    }
-
-    let uploadId: number | undefined;
-    const controller = new AbortController();
-    try {
-      const { id, tokens } = await this.ipc.beginFileUpload({ event: body });
-      uploadId = id;
-      if (!Array.isArray(tokens) || tokens.length !== files.length) {
-        throw new Error("LiveView returned invalid file upload credentials");
-      }
-      // Limit each batch to four concurrent uploads.
-      let nextFile = 0;
-      await Promise.all(Array.from({ length: Math.min(4, files.length) }, async () => {
-        while (!controller.signal.aborted && nextFile < files.length) {
-          const fileIndex = nextFile++;
-          await this.ipc.uploadFile(tokens[fileIndex], files[fileIndex], controller.signal);
-        }
-      }));
-      // Each uploadFile call above sends an HTTP PUT to <websocket-path>/upload/<token>
-      // A fallback route can return 2xx even if LiveView's upload handler never received the files.
-      // completeFileUpload asks LiveView over the WebSocket to verify the batch and
-      // dispatch its form event, then waits for confirmation. Other events can continue.
-      await this.ipc.completeFileUpload(id);
-    } catch (error) {
-      controller.abort();
-      if (uploadId !== undefined) {
-        try {
-          this.ipc.cancelFileUpload(uploadId);
-        } catch {
-          // The websocket may be the reason the upload failed.
-        }
-      }
-      throw error;
-    }
-  }
 }
+
+type SerializedHtmlEvent = {
+  name: string;
+  element: number;
+  data: any;
+  bubbles: boolean;
+};
 
 type EventSyncResult = {
   preventDefault: boolean;
   stopPropagation: boolean;
 };
 
-// This function sends the event to the virtualdom and then waits for the virtualdom to process it
-//
-// However, it's not really suitable for liveview, because it's synchronous and will block the main thread
-// We should definitely consider using a websocket if we want to block... or just not block on liveview
-// Liveview is a little bit of a tricky beast
+// Desktop events are synchronous so their handlers can control browser defaults.
 function handleVirtualdomEventSync(
   endpoint: string,
   contents: string
