@@ -182,11 +182,11 @@ impl LiveViewPool {
         self
     }
 
-    /// Set the maximum number of files accepted in one LiveView upload batch.
+    /// Set the maximum number of incoming and retained files per LiveView connection.
     ///
-    /// This limit also applies to zero-byte files so a batch cannot consume unbounded registry
-    /// entries or temporary-file metadata without counting toward the byte limit. Defaults to
-    /// [`crate::DEFAULT_UPLOAD_FILE_LIMIT`] (1024 files).
+    /// Each file counts from registration until its last handle or reader is dropped, across
+    /// all batches. This also counts zero-byte files, independently of the byte limit. Defaults
+    /// to [`crate::DEFAULT_UPLOAD_FILE_LIMIT`] (1024 files).
     pub fn with_upload_file_limit(mut self, limit: usize) -> Self {
         self.uploads = self.uploads.with_file_limit(limit);
         self

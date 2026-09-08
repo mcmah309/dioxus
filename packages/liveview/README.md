@@ -36,10 +36,9 @@ Dioxus-LiveView exports some primitives to wire up an app into an existing backe
 ## File uploads
 
 Files stream over HTTP into files in the system temporary directory. Each LiveView
-connection defaults to a 1 GiB cap across incoming and retained uploads, each batch
-is limited to 1024 files, and registered batches have five minutes to start
-uploading. Set any of these values before cloning the pool for the WebSocket and
-HTTP upload routes:
+connection defaults to a 1 GiB cap and a 1024-file cap across incoming and retained
+uploads, and registered batches have five minutes to start uploading. Set any of
+these values before cloning the pool for the WebSocket and HTTP upload routes:
 
 ```rust
 use dioxus_liveview::LiveViewPool;
@@ -77,19 +76,20 @@ failed uploads report an error and leave the connection available for retrying.
 
 Multiple upload events can run concurrently on one connection. Each batch has its
 own credentials, completion response, cancellation, and timeout; all batches and
-retained files share the connection's data limit. The browser sends up to four
-files concurrently within each batch and preserves the selection's file order in
-the delivered event.
+retained files share the connection's byte and file-count limits. The browser sends
+up to four files concurrently within each batch and preserves the selection's file
+order in the delivered event.
 
 Clicks, text edits, and other events proceed while files upload. Events carrying
 files are dispatched only after their own batch completes, so they can arrive
 after later UI events or faster uploads, including uploads from the same input.
 
 Omitted settings keep their defaults. A file's declared size counts toward the cap
-from registration until its last `FileData` handle or reader is dropped. Dropping
-the last handle deletes the temporary file and releases its quota. Canceled and
-failed uploads also clean up their temporary files. Each connection has its own
-budget; the pool does not identify accounts across connections.
+from registration until its last `FileData` handle or reader is dropped. Every file,
+including an empty file, also reserves one slot in the connection's file-count limit.
+Dropping the last handle deletes the temporary file and releases both reservations.
+Canceled and failed uploads also clean up their temporary files. Each connection
+has its own budget; the pool does not identify accounts across connections.
 
 The timeout releases unused upload reservations without waiting for another
 upload. Once a batch starts uploading, it remains valid until completion or

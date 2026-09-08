@@ -23,7 +23,7 @@ pub use config::*;
 /// The default cap on incoming and retained temporary-file data per LiveView connection.
 pub const DEFAULT_UPLOAD_LIMIT: u64 = 1024 * 1024 * 1024;
 
-/// The default number of files allowed in a single LiveView upload batch.
+/// The default cap on incoming and retained files per LiveView connection.
 pub const DEFAULT_UPLOAD_FILE_LIMIT: usize = 1024;
 
 /// How long a registered upload batch may wait for its first HTTP request by default.

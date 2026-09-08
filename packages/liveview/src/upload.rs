@@ -6,7 +6,7 @@ use std::{
     io::Write,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -27,7 +27,7 @@ pub(crate) enum UploadError {
     StorageFailed(String),
     #[error("LiveView file upload exceeds the connection's upload data limit")]
     LimitExceeded,
-    #[error("LiveView file upload contains too many files")]
+    #[error("LiveView file upload exceeds the connection's file count limit")]
     FileCountLimitExceeded,
     #[error("failed to read LiveView file upload body")]
     BodyReadFailed,
@@ -51,7 +51,9 @@ pub(crate) struct FileUploadRegistry {
 
 pub(crate) struct UploadSession {
     reserved_bytes: Arc<AtomicU64>,
+    reserved_files: Arc<AtomicUsize>,
     data_limit: u64,
+    file_limit: usize,
 }
 
 struct RegisteredUpload {
@@ -75,6 +77,7 @@ impl UploadGroup {
 struct UploadReservation {
     bytes: u64,
     reserved_bytes: Arc<AtomicU64>,
+    reserved_files: Arc<AtomicUsize>,
 }
 
 struct TemporaryUpload {
@@ -149,7 +152,9 @@ impl FileUploadRegistry {
     pub(crate) fn new_session(&self) -> UploadSession {
         UploadSession {
             reserved_bytes: Default::default(),
+            reserved_files: Default::default(),
             data_limit: self.data_limit,
+            file_limit: self.file_limit,
         }
     }
 
@@ -158,9 +163,6 @@ impl FileUploadRegistry {
         session: &UploadSession,
         sizes: &[u64],
     ) -> Result<Vec<String>, UploadError> {
-        if sizes.len() > self.file_limit {
-            return Err(UploadError::FileCountLimitExceeded);
-        }
         {
             let now = Instant::now();
             let mut registry = self.uploads.lock().unwrap();
@@ -338,6 +340,23 @@ impl UploadSession {
         let total = sizes.iter().try_fold(0_u64, |total, size| {
             total.checked_add(*size).ok_or(UploadError::LimitExceeded)
         })?;
+        self.reserved_files
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                reserved
+                    .checked_add(sizes.len())
+                    .filter(|count| *count <= self.file_limit)
+            })
+            .map_err(|_| UploadError::FileCountLimitExceeded)?;
+        // Every reservation owns one file slot, including empty files. Construct these before
+        // reserving bytes so a failed byte reservation also releases the file slots.
+        let mut reservations: Vec<_> = sizes
+            .iter()
+            .map(|_| UploadReservation {
+                bytes: 0,
+                reserved_bytes: self.reserved_bytes.clone(),
+                reserved_files: self.reserved_files.clone(),
+            })
+            .collect();
         let mut reserved = self.reserved_bytes.load(Ordering::Acquire);
         loop {
             let next = reserved
@@ -353,13 +372,10 @@ impl UploadSession {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    return Ok(sizes
-                        .iter()
-                        .map(|bytes| UploadReservation {
-                            bytes: *bytes,
-                            reserved_bytes: self.reserved_bytes.clone(),
-                        })
-                        .collect());
+                    for (reservation, size) in reservations.iter_mut().zip(sizes) {
+                        reservation.bytes = *size;
+                    }
+                    return Ok(reservations);
                 }
                 Err(current) => reserved = current,
             }
@@ -370,6 +386,7 @@ impl UploadSession {
 impl Drop for UploadReservation {
     fn drop(&mut self) {
         self.reserved_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.reserved_files.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
