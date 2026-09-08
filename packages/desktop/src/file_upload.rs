@@ -269,6 +269,31 @@ impl DesktopFormData {
     }
 }
 
+impl From<SerializedFormData> for DesktopFormData {
+    fn from(form: SerializedFormData) -> Self {
+        Self {
+            value: form.value,
+            valid: form.valid,
+            values: form
+                .values
+                .into_iter()
+                .map(|obj| {
+                    let value = if let Some(text) = obj.text {
+                        FormValue::Text(text)
+                    } else if let Some(file) =
+                        obj.file.filter(|file| !file.path.as_os_str().is_empty())
+                    {
+                        FormValue::File(Some(FileData::new(DesktopFileData(file.path))))
+                    } else {
+                        FormValue::File(None)
+                    };
+                    (obj.key, value)
+                })
+                .collect(),
+        }
+    }
+}
+
 impl HasFileData for DesktopFormData {
     fn files(&self) -> Vec<FileData> {
         self.values
@@ -477,3 +502,86 @@ impl NativeFileData for DesktopFileData {
 }
 
 pub struct DesktopDataTransfer {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dioxus_html::{FormData, SerializedFileData};
+    use futures_util::FutureExt;
+
+    #[test]
+    fn unselected_files_and_empty_text_match_serialized_form_data() {
+        #[derive(Deserialize)]
+        struct Fields {
+            description: String,
+            upload: SerializedFileData,
+        }
+
+        // The shared interpreter sends an unselected file as a field with neither text nor file.
+        let serialized: SerializedFormData = serde_json::from_value(serde_json::json!({
+            "values": [
+                { "key": "description", "text": "" },
+                { "key": "upload" }
+            ]
+        }))
+        .unwrap();
+        for form in [
+            FormData::new(serialized.clone()),
+            FormData::new(DesktopFormData::from(serialized)),
+        ] {
+            assert_eq!(
+                form.get_first("description"),
+                Some(FormValue::Text(String::new()))
+            );
+            assert_eq!(form.get_first("upload"), Some(FormValue::File(None)));
+            assert!(form.get_first("missing").is_none());
+            assert!(form.files().is_empty());
+            let fields: Fields = form.parsed_values().unwrap();
+            assert!(fields.description.is_empty());
+            assert_eq!(fields.upload, SerializedFileData::empty());
+        }
+    }
+
+    #[test]
+    fn selected_zero_byte_files_can_be_parsed_and_read() {
+        #[derive(Deserialize)]
+        struct Fields {
+            upload: FileData,
+        }
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let serialized: SerializedFormData = serde_json::from_value(serde_json::json!({
+            "values": [{
+                "key": "upload",
+                "file": {
+                    "path": file.path(), "size": 0, "last_modified": 0,
+                    "content_type": "application/octet-stream"
+                }
+            }]
+        }))
+        .unwrap();
+        for form in [
+            FormData::new(serialized.clone()),
+            FormData::new(DesktopFormData::from(serialized)),
+        ] {
+            let Some(FormValue::File(Some(selected))) = form.get_first("upload") else {
+                panic!("a selected zero-byte file must remain selected");
+            };
+            assert_eq!(form.files(), vec![selected.clone()]);
+            assert_eq!(selected.size(), 0);
+            let fields: Fields = form.parsed_values().unwrap();
+            drop(form);
+            assert_eq!(fields.upload.path(), file.path());
+            assert_eq!(fields.upload.name(), selected.name());
+            assert!(
+                fields
+                    .upload
+                    .read_bytes()
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+}

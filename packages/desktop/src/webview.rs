@@ -1,7 +1,7 @@
 use crate::WeakDesktopContext;
 use crate::desktop_context::{PendingDesktopWindow, PendingWindowCancellation};
 use crate::desktop_state::DesktopAppContext;
-use crate::file_upload::{DesktopFileData, DesktopFileDragEvent};
+use crate::file_upload::DesktopFileDragEvent;
 use crate::menubar::DioxusMenu;
 use crate::{
     DesktopContext, DesktopService, WindowConfig, assets::AssetHandlerRegistry, edits::WryQueue,
@@ -11,7 +11,7 @@ use crate::{element::DesktopElement, file_upload::DesktopFormData};
 use base64::prelude::BASE64_STANDARD;
 use dioxus_core::{RenderTargetId, Runtime, VirtualDom};
 use dioxus_hooks::to_owned;
-use dioxus_html::{FileData, FormValue, HtmlEvent, PlatformEventData, SerializedFileData};
+use dioxus_html::{HtmlEvent, PlatformEventData, SerializedFileData};
 use std::rc::Rc;
 use std::sync::{Arc, atomic::AtomicBool};
 use std::{cell::OnceCell, time::Duration};
@@ -154,36 +154,9 @@ impl WebviewEdits {
                 let element = DesktopElement::new(element, desktop_context.clone(), query.clone());
                 Rc::new(PlatformEventData::new(Box::new(element)))
             }
-            dioxus_html::EventData::Form(form) => {
-                Rc::new(PlatformEventData::new(Box::new(DesktopFormData {
-                    value: form.value,
-                    valid: form.valid,
-                    values: form
-                        .values
-                        .into_iter()
-                        .map(|obj| {
-                            if let Some(text) = obj.text {
-                                return (obj.key, FormValue::Text(text));
-                            }
-
-                            if let Some(file_data) = obj.file {
-                                if file_data.path.capacity() == 0 {
-                                    return (obj.key, FormValue::File(None));
-                                }
-
-                                return (
-                                    obj.key,
-                                    FormValue::File(Some(FileData::new(DesktopFileData(
-                                        file_data.path,
-                                    )))),
-                                );
-                            };
-
-                            (obj.key, FormValue::Text(String::new()))
-                        })
-                        .collect(),
-                })))
-            }
+            dioxus_html::EventData::Form(form) => Rc::new(PlatformEventData::new(Box::new(
+                DesktopFormData::from(form),
+            ))),
             // Which also includes drops...
             dioxus_html::EventData::Drag(ref drag) => {
                 // we want to override this with a native file engine, provided by the most recent drag event

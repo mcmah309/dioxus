@@ -195,6 +195,38 @@ mod tests {
     use crate::upload::{FileUploadRegistry, UploadError, UploadSession};
     use futures_util::StreamExt;
 
+    #[test]
+    fn unselected_files_and_empty_text_match_serialized_form_data() {
+        #[derive(serde::Deserialize)]
+        struct Fields {
+            description: String,
+            upload: SerializedFileData,
+        }
+
+        let serialized: SerializedFormData = serde_json::from_value(serde_json::json!({
+            "values": [
+                { "key": "description", "text": "" },
+                { "key": "upload" }
+            ]
+        }))
+        .unwrap();
+        for form in [
+            dioxus_html::FormData::new(serialized.clone()),
+            dioxus_html::FormData::new(LiveviewFormData::new(serialized, Vec::new())),
+        ] {
+            assert_eq!(
+                form.get_first("description"),
+                Some(FormValue::Text(String::new()))
+            );
+            assert_eq!(form.get_first("upload"), Some(FormValue::File(None)));
+            assert!(form.get_first("missing").is_none());
+            assert!(form.files().is_empty());
+            let fields: Fields = form.parsed_values().unwrap();
+            assert!(fields.description.is_empty());
+            assert_eq!(fields.upload, SerializedFileData::empty());
+        }
+    }
+
     async fn uploaded_file(contents: Bytes) -> (FileData, FileUploadRegistry, UploadSession) {
         let registry = FileUploadRegistry::new(contents.len() as u64);
         let session = registry.new_session();
