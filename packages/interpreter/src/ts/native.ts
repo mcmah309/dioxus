@@ -343,14 +343,15 @@ export class NativeInterpreter extends JSChannel_ {
       bubbles,
     };
 
-    let entries: [string, FormDataEntryValue][] | undefined;
+    let formEntries: [string, FormDataEntryValue][] | undefined;
     if (this.liveview) {
-      // Don't re-upload files when other form fields change.
-      const uploadFiles = target instanceof HTMLElement &&
+      // Upload file contents for file-input and submit events.
+      // Other form events send file metadata only.
+      const shouldUploadFiles = target instanceof HTMLElement &&
         (name === "submit" ||
           (target instanceof HTMLInputElement && target.type === "file" &&
             (name === "input" || name === "change")));
-      entries = uploadFiles ? this.snapshotFormEntries(target) : undefined;
+      formEntries = shouldUploadFiles ? this.snapshotFormEntries(target) : undefined;
 
       // Preserve unselected file fields as File(None).
       if (contents.values) {
@@ -362,7 +363,7 @@ export class NativeInterpreter extends JSChannel_ {
       }
     }
 
-    const response = this.sendSerializedEvent(body, entries);
+    const response = this.sendSerializedEvent(body, formEntries);
     // capture/prevent default of the event if the virtualdom wants to
     if (response) {
       if (response.preventDefault) {
@@ -387,7 +388,7 @@ export class NativeInterpreter extends JSChannel_ {
     bubbles: boolean;
   }, entries?: [string, FormDataEntryValue][]): EventSyncResult | void {
     if (this.liveview) {
-      // Start each event immediately and report both synchronous send errors and upload failures.
+      // Send each event independently so uploads don't block other events.
       this.sendLiveviewEvent(body, entries).catch((error) => {
         console.error("Failed to send LiveView event", error);
       });
@@ -515,7 +516,9 @@ export class NativeInterpreter extends JSChannel_ {
       ? target.form
       : target.closest("form");
     const entries = form ? Array.from(new FormData(form).entries()) : [];
-    if (target instanceof HTMLInputElement && (!form || !target.name)) {
+    const shouldAppendInputFiles =
+    target instanceof HTMLInputElement && (!form || !target.name);
+    if (shouldAppendInputFiles) {
       const files = Array.from(target.files || []);
       for (const file of files) {
         entries.push([target.name, file]);
@@ -529,9 +532,9 @@ export class NativeInterpreter extends JSChannel_ {
 
   private async sendLiveviewEvent(
     body: { name: string; element: number; data: any; bubbles: boolean },
-    entries?: [string, FormDataEntryValue][]
+    formEntries?: [string, FormDataEntryValue][]
   ): Promise<void> {
-    if (!entries) {
+    if (!formEntries) {
       this.sendIpcMessage("user_event", body);
       return;
     }
@@ -539,14 +542,14 @@ export class NativeInterpreter extends JSChannel_ {
     const values: SerializedFormObject[] = [];
     const files: File[] = [];
 
-    for (const [key, value] of entries) {
+    for (const [key, value] of formEntries) {
       if (!(value instanceof File)) {
         values.push({ key, text: value });
         continue;
       }
 
-      // FormData represents an unselected file input with an empty File.
-      if (value.name === "" && value.size === 0) {
+      const isEmptyFileSelection = value.name === "" && value.size === 0;
+      if (isEmptyFileSelection) {
         values.push({ key });
         continue;
       }
@@ -582,7 +585,7 @@ export class NativeInterpreter extends JSChannel_ {
       if (!Array.isArray(tokens) || tokens.length !== files.length) {
         throw new Error("LiveView returned invalid file upload credentials");
       }
-      // Limit parallel requests within each batch while allowing other batches to progress.
+      // Limit each batch to four concurrent uploads.
       let nextFile = 0;
       await Promise.all(Array.from({ length: Math.min(4, files.length) }, async () => {
         while (!controller.signal.aborted && nextFile < files.length) {
