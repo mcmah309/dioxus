@@ -222,9 +222,7 @@ async fn main() {
                 .allow_methods([axum::http::Method::PUT])
                 .allow_headers([
                     axum::http::header::CONTENT_TYPE,
-                    axum::http::header::CONTENT_DISPOSITION,
                     axum::http::HeaderName::from_static("x-content-size"),
-                    axum::http::HeaderName::from_static("x-request-client"),
                 ])
                 .allow_credentials(true),
         );

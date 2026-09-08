@@ -352,15 +352,6 @@ export class NativeInterpreter extends JSChannel_ {
           (target instanceof HTMLInputElement && target.type === "file" &&
             (name === "input" || name === "change")));
       formEntries = shouldUploadFiles ? this.snapshotFormEntries(target) : undefined;
-
-      // Preserve unselected file fields as File(None).
-      if (contents.values) {
-        contents.values = contents.values.map((value) =>
-          value.file?.path === "" && value.file.size === 0
-            ? { key: value.key }
-            : value
-        );
-      }
     }
 
     const response = this.sendSerializedEvent(body, formEntries);
@@ -572,15 +563,10 @@ export class NativeInterpreter extends JSChannel_ {
       return;
     }
 
-    const size = files.reduce((total, file) => total + file.size, 0);
-    if (!Number.isSafeInteger(size)) {
-      throw new Error("LiveView file upload size exceeds JavaScript's safe integer range");
-    }
-
     let uploadId: number | undefined;
     const controller = new AbortController();
     try {
-      const { id, tokens } = await this.ipc.beginFileUpload({ size, event: body });
+      const { id, tokens } = await this.ipc.beginFileUpload({ event: body });
       uploadId = id;
       if (!Array.isArray(tokens) || tokens.length !== files.length) {
         throw new Error("LiveView returned invalid file upload credentials");

@@ -135,8 +135,6 @@ class IPC {
         "Content-Type": file.type,
         "Content-Length": contentLength,
         "X-Content-Size": contentLength,
-        "Content-Disposition": `attachment; filename="${escape(file.name)}"`,
-        "X-Request-Client": "dioxus",
       },
       body: file,
       signal,

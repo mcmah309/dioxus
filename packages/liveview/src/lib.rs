@@ -43,8 +43,6 @@ impl<T> WebsocketRx for T where T: StreamExt<Item = Result<String, LiveViewError
 pub enum LiveViewError {
     #[error("Sending to client error")]
     SendingFailed,
-    #[error("LiveView file upload failed: {0}")]
-    FileUploadFailed(String),
 }
 
 fn handle_edits_code() -> String {

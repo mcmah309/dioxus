@@ -25,7 +25,6 @@ use tokio_util::task::LocalPoolHandle;
 
 #[derive(Deserialize, Debug)]
 struct FileUploadStart {
-    size: u64,
     event: Box<HtmlEvent>,
 }
 
@@ -51,7 +50,6 @@ enum IpcMessage {
 
 struct PendingFileUpload {
     event: Option<Box<HtmlEvent>>,
-    file_count: usize,
     tokens: Vec<String>,
     uploads: crate::upload::FileUploadRegistry,
     cleanup: Option<AbortHandle>,
@@ -66,22 +64,13 @@ impl PendingFileUpload {
         let EventData::Form(form) = &upload.event.data else {
             return Err("file upload did not contain a form event".to_string());
         };
-        let mut size = 0_u64;
-        let mut sizes = Vec::new();
-        for value in &form.values {
-            let Some(file) = value.file.as_ref() else {
-                continue;
-            };
-            size = size
-                .checked_add(file.size)
-                .ok_or_else(|| "file upload size overflowed".to_string())?;
-            sizes.push(file.size);
-        }
+        let sizes: Vec<_> = form
+            .values
+            .iter()
+            .filter_map(|value| value.file.as_ref().map(|file| file.size))
+            .collect();
         if sizes.is_empty() {
             return Err("file upload did not contain any files".to_string());
-        }
-        if size != upload.size {
-            return Err("file upload size did not match its file metadata".to_string());
         }
         let tokens = uploads
             .register(session, &sizes)
@@ -89,7 +78,6 @@ impl PendingFileUpload {
 
         Ok(Self {
             event: Some(upload.event),
-            file_count: sizes.len(),
             tokens,
             uploads,
             cleanup: None,
@@ -115,9 +103,6 @@ impl PendingFileUpload {
             .take_completed(&self.tokens)
             .map_err(|error| error.to_string())?;
         self.tokens.clear();
-        if files.len() != self.file_count {
-            return Err("file upload response did not contain every file".to_string());
-        }
         Ok((self.event.take().unwrap(), files))
     }
 }
@@ -593,7 +578,7 @@ mod tests {
             self.send(
                 "file_upload",
                 serde_json::json!({
-                    "id": id, "size": size,
+                    "id": id,
                     "event": {
                         "element": 0, "name": "change", "bubbles": true,
                         "data": { "values": [{ "key": "file", "file": {
@@ -746,7 +731,6 @@ mod tests {
             "method": "file_upload",
             "params": {
                 "id": 0,
-                "size": 3,
                 "event": {
                     "element": 0,
                     "name": "change",
@@ -835,22 +819,5 @@ mod tests {
         assert!(paths.iter().all(|path| path.exists()));
         drop(files);
         assert!(paths.iter().all(|path| !path.exists()));
-    }
-
-    #[test]
-    fn upload_size_must_match_the_file_metadata() {
-        let uploads = crate::upload::FileUploadRegistry::default();
-        let mut pending = pending_upload(uploads);
-        let mut upload = pending.event.take().unwrap();
-        let EventData::Form(form) = &mut upload.data else {
-            unreachable!()
-        };
-        form.values[1].file.as_mut().unwrap().size = 4;
-        let upload = FileUploadStart {
-            size: 3,
-            event: upload,
-        };
-        let uploads = crate::upload::FileUploadRegistry::default();
-        assert!(PendingFileUpload::new(upload, uploads.clone(), &uploads.new_session()).is_err());
     }
 }

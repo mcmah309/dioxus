@@ -111,9 +111,9 @@ is deprecated because its upload registry is inaccessible to the HTTP handler.
 Uploads use the HTTP equivalent of the configured WebSocket URL and include the
 destination origin's credentials. If that URL is cross-origin, configure CORS on
 the upload router with the exact page origin. Credentialed CORS cannot use a
-wildcard origin. The upload request uses `PUT` with `Content-Type`,
-`Content-Disposition`, `X-Content-Size`, and `X-Request-Client` headers, so the CORS
-layer must allow that method and those headers. Enable the `cors` feature on
+wildcard origin. The upload request uses `PUT` with `Content-Type` and
+`X-Content-Size` headers, so the CORS layer must allow that method and those
+headers. Enable the `cors` feature on
 `tower-http` for this example:
 
 ```rust
@@ -129,9 +129,7 @@ let upload_cors = CorsLayer::new()
     .allow_methods([Method::PUT])
     .allow_headers([
         header::CONTENT_TYPE,
-        header::CONTENT_DISPOSITION,
         HeaderName::from_static("x-content-size"),
-        HeaderName::from_static("x-request-client"),
     ])
     .allow_credentials(true);
 

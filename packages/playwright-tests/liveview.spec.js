@@ -201,11 +201,14 @@ test("multiple files, including a large file, upload over HTTP", async ({ page }
     `second.bin|${secondSize}|42|42`,
   ].join("\n"));
   expect(closed).toBe(false);
-  expect(uploadMetadata.size).toBe(largeSize + secondSize);
+  expect(uploadMetadata.event.data.values).toMatchObject([
+    { file: { path: "large.bin", size: largeSize } },
+    { file: { path: "second.bin", size: secondSize } },
+  ]);
   expect(uploadRequests).toHaveLength(2);
-  for (const [request, name, size] of [
-    [uploadRequests[0], "large.bin", largeSize],
-    [uploadRequests[1], "second.bin", secondSize],
+  for (const [request, size] of [
+    [uploadRequests[0], largeSize],
+    [uploadRequests[1], secondSize],
   ]) {
     expect(request.method()).toBe("PUT");
     expect(new URL(request.url()).pathname).toMatch(/^\/ws\/upload\/[0-9a-f-]+$/);
@@ -213,10 +216,6 @@ test("multiple files, including a large file, upload over HTTP", async ({ page }
     expect(uploadHeaders["content-type"]).toBe("application/octet-stream");
     expect(uploadHeaders["content-length"]).toBe(size.toString());
     expect(uploadHeaders["x-content-size"]).toBe(size.toString());
-    expect(uploadHeaders["content-disposition"]).toBe(
-      `attachment; filename="${name}"`
-    );
-    expect(uploadHeaders["x-request-client"]).toBe("dioxus");
   }
 });
 
@@ -259,7 +258,6 @@ test("retained files count toward only their connection's upload cap", async ({ 
     return page.evaluate(async (size) => {
       try {
         const { id } = await window.ipc.beginFileUpload({
-          size,
           event: {
             element: 0, name: "change", bubbles: true,
             data: { values: [{ key: "file", file: {
@@ -609,7 +607,6 @@ test("concurrent batches share the default connection quota and cancel independe
     async function reserve(size) {
       try {
         return await window.ipc.beginFileUpload({
-          size,
           event: {
             element: 0, name: "change", bubbles: true,
             data: { values: [{ key: "file", file: {
@@ -646,7 +643,36 @@ test("concurrent batches share the default connection quota and cancel independe
   await expect(page.locator("#large-upload")).toHaveText("retry.bin|1|42|42");
 });
 
+// Associate HTTP requests with filenames using the upload metadata and returned tokens.
+function trackUploadNames(page) {
+  const namesByToken = new Map();
+  page.on("websocket", (socket) => {
+    const batches = new Map();
+    socket.on("framesent", ({ payload }) => {
+      if (typeof payload !== "string" || !payload.startsWith("{")) return;
+      const message = JSON.parse(payload);
+      if (message.method === "file_upload") {
+        batches.set(message.params.id, message.params.event.data.values
+          .filter((value) => value.file).map((value) => value.file.path));
+      }
+    });
+    socket.on("framereceived", ({ payload }) => {
+      if (typeof payload === "string" || payload[0] !== 0) return;
+      const text = payload.subarray(1).toString();
+      if (!text.startsWith("{")) return;
+      const message = JSON.parse(text);
+      if (message.type === "file_upload") {
+        const names = batches.get(message.data.id);
+        message.data.tokens.forEach((token, index) => namesByToken.set(token, names[index]));
+        batches.delete(message.data.id);
+      }
+    });
+  });
+  return (request) => namesByToken.get(new URL(request.url()).pathname.split("/").pop());
+}
+
 test("a failed batch does not cancel another concurrent upload", async ({ page }) => {
+  const uploadName = trackUploadNames(page);
   const errors = [];
   const unhandled = [];
   page.on("console", (message) => {
@@ -655,7 +681,7 @@ test("a failed batch does not cancel another concurrent upload", async ({ page }
   page.on("pageerror", (error) => unhandled.push(error));
   let stalled;
   await page.route("**/ws/upload/*", async (route) => {
-    const name = route.request().headers()["content-disposition"];
+    const name = uploadName(route.request());
     if (name.includes("slow.bin")) {
       stalled = route;
     } else if (name.includes("failed.bin")) {
@@ -685,13 +711,14 @@ test("a failed batch does not cancel another concurrent upload", async ({ page }
 });
 
 test("files within a batch upload concurrently and preserve their metadata order", async ({ page }) => {
+  const uploadName = trackUploadNames(page);
   let stalled;
   let completed = 0;
   page.on("response", (response) => {
     if (response.url().includes("/ws/upload/") && response.status() === 204) completed++;
   });
   await page.route("**/ws/upload/*", (route) => {
-    if (route.request().headers()["content-disposition"].includes("slow.bin")) {
+    if (uploadName(route.request()) === "slow.bin") {
       stalled = route;
     } else {
       return route.continue();
@@ -733,6 +760,7 @@ test("closing the websocket rejects every pending upload request", async ({ page
 });
 
 test("a batch failure aborts its active requests and stops queued files", async ({ page }) => {
+  const uploadName = trackUploadNames(page);
   const stalled = [];
   const aborted = [];
   const unhandled = [];
@@ -741,10 +769,10 @@ test("a batch failure aborts its active requests and stops queued files", async 
   const failureGate = new Promise((resolve) => { releaseFailure = resolve; });
   page.on("pageerror", (error) => unhandled.push(error));
   page.on("requestfailed", (request) => {
-    if (request.headers()["content-disposition"]?.includes("slow")) aborted.push(request);
+    if (uploadName(request)?.startsWith("slow")) aborted.push(request);
   });
   await page.route("**/ws/upload/*", async (route) => {
-    const name = route.request().headers()["content-disposition"];
+    const name = uploadName(route.request());
     if (name.includes("slow")) {
       stalled.push(route);
       if (stalled.length === 3) releaseFailure();
