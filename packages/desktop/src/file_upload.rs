@@ -359,7 +359,7 @@ pub(crate) struct DesktopFileDragEvent {
 }
 
 impl DesktopFileDragEvent {
-    /// The browser usually reports a dropped file's name, but Rust needs its full
+    /// The browser usually reports a drage-and-dropped file's name, but Rust needs its full
     /// filesystem path to open it. Find that path in the list provided by Wry.
     /// For duplicate names without paths, assume the first browser file corresponds
     /// to the first remaining native path with that name, and so on.

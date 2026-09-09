@@ -131,11 +131,13 @@ impl LiveViewPool {
         self
     }
 
-    /// Run an existing VirtualDom on the caller's executor using this pool's upload registry.
+    /// Run  an existing [`VirtualDom`] over a [`LiveViewSocket`] on the current executor.
     ///
-    /// Pass a clone of this pool to the HTTP upload handler so it can receive files for this
-    /// connection. The returned future is not `Send`; await it on a local executor. Use
-    /// [`Self::launch_virtualdom`] to create and run a VirtualDom on the pool's threads instead.
+    /// Use this method to integrate a preconfigured `VirtualDom` with any backend that
+    /// provides a `LiveViewSocket`. Use [`Self::launch_virtualdom`] to construct and run the
+    /// `VirtualDom` on LiveView's thread pool instead.
+    ///
+    /// For file uploads, pass a clone of this pool to the HTTP upload handler.
     pub async fn run(
         &self,
         vdom: VirtualDom,
@@ -511,12 +513,16 @@ mod tests {
                 use dioxus::prelude::*;
                 let mut visible = use_signal(|| true);
                 if !visible() {
-                    return rsx! { div {} };
+                    return rsx! {
+                        div {}
+                    };
                 }
                 rsx! {
                     input {
                         r#type: "file",
-                        onchange: move |event| { let _ = forms.send(event.data()); },
+                        onchange: move |event| {
+                            let _ = forms.send(event.data());
+                        },
                         onreset: move |_| visible.set(false),
                     }
                 }

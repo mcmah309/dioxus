@@ -94,9 +94,9 @@ impl FormData {
         T: serde::de::DeserializeOwned,
     {
         use crate::SerializedFileData;
-        use serde_json::Value;
+        use serde_json::{Map, Value, map::Entry};
 
-        let mut fields = std::collections::BTreeMap::<String, Vec<Value>>::new();
+        let mut fields = Map::new();
         for (key, value) in self.values() {
             let value = match value {
                 FormValue::Text(text) => Value::String(text),
@@ -104,20 +104,24 @@ impl FormData {
                     serde_json::to_value(file.as_ref().map(SerializedFileData::from_file_data))?
                 }
             };
-            fields.entry(key).or_default().push(value);
+
+            match fields.entry(key) {
+                Entry::Vacant(entry) => {
+                    entry.insert(value);
+                }
+                Entry::Occupied(mut entry) => {
+                    let existing = entry.get_mut();
+                    match existing {
+                        Value::Array(values) => values.push(value),
+                        existing => {
+                            let first = existing.take();
+                            *existing = Value::Array(vec![first, value]);
+                        }
+                    }
+                }
+            }
         }
 
-        let fields = fields
-            .into_iter()
-            .map(|(key, mut values)| {
-                let value = if values.len() == 1 {
-                    values.pop().unwrap()
-                } else {
-                    Value::Array(values)
-                };
-                (key, value)
-            })
-            .collect();
         serde_json::from_value(Value::Object(fields))
     }
 }

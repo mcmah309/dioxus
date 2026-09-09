@@ -58,7 +58,7 @@ impl FileData {
     /// - Liveview returns an empty path until the upload completes successfully, then
     ///   the server's temporary file path. The path stays empty while the upload is
     ///   pending or if the transfer fails or the contents are unavailable. An upload is
-    ///   lazily trigged by the first read of the data. Keep an original liveview file handle
+    ///   lazily triggered by the first read of the data. Keep an original liveview file handle
     ///   alive while using its temporary path. Use [`Self::name`] to obtain the browser's filename.
     pub fn path(&self) -> PathBuf {
         self.inner.path()

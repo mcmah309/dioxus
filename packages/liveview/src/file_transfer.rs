@@ -8,8 +8,8 @@ use tokio::sync::{mpsc::UnboundedSender, oneshot};
 
 type TransferResult = Result<Arc<StoredFile>, String>;
 
-/// Owns a browser File independently of the input that selected it. The shared future starts
-/// the HTTP transfer on its first poll and caches the result for every subsequent reader.
+/// Represents a file selected in the browser independently of its input element.
+/// The first read requests the upload, and all readers share the resulting stored file or error.
 pub(crate) struct RemoteFile {
     id: u64,
     commands: UnboundedSender<FileCommand>,
@@ -26,7 +26,6 @@ impl RemoteFile {
         commands: UnboundedSender<FileCommand>,
     ) -> Self {
         let reservation = uploads.reserve(session, size);
-        // A rejected handle still exposes metadata, but reading it reports the quota error.
         let retained = reservation.is_ok();
         if !retained {
             let _ = commands.send(FileCommand::Release { id });
@@ -103,7 +102,7 @@ impl Drop for TransferGuard {
     }
 }
 
-/// The connection owns only the response sender, so it cannot keep an abandoned file alive.
+/// Tracks a pending upload without retaining the `RemoteFile` that requested it
 pub(crate) struct PendingFileUpload {
     pub(crate) token: String,
     uploads: FileUploadRegistry,

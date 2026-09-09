@@ -40,10 +40,6 @@ async fn transform_tx(message: Vec<u8>) -> Result<Message, axum::Error> {
 ///
 /// Mount this at the websocket route with `/upload/{token}` appended. For example, a websocket
 /// mounted at `/liveview` should mount this route at `/liveview/upload/{token}`.
-///
-/// When the page and websocket endpoint have different origins, apply a CORS layer that allows
-/// the page's exact origin, credentials, `PUT`, and the upload headers. See the crate README's
-/// "Cross-origin WebSocket URLs" section for a complete example.
 pub fn axum_file_upload(view: LiveViewPool) -> MethodRouter {
     put(move |Path(token): Path<String>, request: Request| {
         let view = view.clone();

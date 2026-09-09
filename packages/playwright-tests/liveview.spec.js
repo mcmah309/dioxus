@@ -202,8 +202,8 @@ test("multiple files, including a large file, upload over HTTP", async ({ page }
   ].join("\n"));
   expect(closed).toBe(false);
   expect(uploadMetadata.event.data.values).toMatchObject([
-    { file: { path: "large.bin", size: largeSize } },
-    { file: { path: "second.bin", size: secondSize } },
+    { file: { name: "large.bin", path: "", size: largeSize } },
+    { file: { name: "second.bin", path: "", size: secondSize } },
   ]);
   expect(uploadRequests).toHaveLength(2);
   for (const [request, size] of [
@@ -619,7 +619,7 @@ function trackUploadNames(page) {
       if (typeof payload !== "string" || !payload.startsWith("{")) return;
       const message = JSON.parse(payload);
       if (message.method === "file_event") {
-        const names = message.params.event.data.values.filter((value) => value.file).map((value) => value.file.path);
+        const names = message.params.event.data.values.filter((value) => value.file).map((value) => value.file.name);
         message.params.file_ids.forEach((id, index) => namesById.set(id, names[index]));
       }
     });
