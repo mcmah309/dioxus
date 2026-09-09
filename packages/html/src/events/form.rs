@@ -4,10 +4,6 @@ use std::fmt::Debug;
 
 use dioxus_core::Event;
 
-#[cfg(feature = "serialize")]
-#[path = "form/deserialize.rs"]
-mod deserialize;
-
 pub type FormEvent = Event<FormData>;
 
 /* DOMEvent:  Send + SyncTarget relatedTarget */
@@ -84,16 +80,45 @@ impl FormData {
 }
 
 impl FormData {
-    /// Parse the values into a struct with one field per value
+    /// Deserialize form values by input name.
     ///
-    /// Fields of type [`FileData`] retain the original file, including its contents and
-    /// any temporary-file ownership, independently of this event.
+    /// Text values are strings; files are [`crate::SerializedFileData`] metadata.
+    /// Use `Option<SerializedFileData>` for optional uploads (`None` when unselected).
+    /// Repeated names become sequences; a single value is deserialized directly.
+    ///
+    /// To read file contents, obtain [`FileData`] handles with [`Self::get_first`],
+    /// [`Self::get`], or [`Self::files`].
     #[cfg(feature = "serialize")]
-    pub fn parsed_values<T>(&self) -> Result<T, serde_json::Error>
+    pub fn deserialize_values<T>(&self) -> Result<T, serde_json::Error>
     where
         T: serde::de::DeserializeOwned,
     {
-        deserialize::from_values(self.values())
+        use crate::SerializedFileData;
+        use serde_json::Value;
+
+        let mut fields = std::collections::BTreeMap::<String, Vec<Value>>::new();
+        for (key, value) in self.values() {
+            let value = match value {
+                FormValue::Text(text) => Value::String(text),
+                FormValue::File(file) => {
+                    serde_json::to_value(file.as_ref().map(SerializedFileData::from_file_data))?
+                }
+            };
+            fields.entry(key).or_default().push(value);
+        }
+
+        let fields = fields
+            .into_iter()
+            .map(|(key, mut values)| {
+                let value = if values.len() == 1 {
+                    values.pop().unwrap()
+                } else {
+                    Value::Array(values)
+                };
+                (key, value)
+            })
+            .collect();
+        serde_json::from_value(Value::Object(fields))
     }
 }
 
@@ -188,6 +213,7 @@ mod serialize {
     pub struct SerializedFormObject {
         pub key: String,
         pub text: Option<String>,
+        /// `None` for an unselected file input
         pub file: Option<SerializedFileData>,
     }
 
@@ -220,10 +246,7 @@ mod serialize {
                     FormValue::File(f) => SerializedFormObject {
                         key: key.clone(),
                         text: None,
-                        file: Some(f.as_ref().map_or_else(
-                            SerializedFileData::empty,
-                            SerializedFileData::from_file_data,
-                        )),
+                        file: f.as_ref().map(SerializedFileData::from_file_data),
                     },
                 })
                 .collect();
@@ -247,11 +270,7 @@ mod serialize {
                 .map(|v| {
                     let value = if let Some(text) = &v.text {
                         FormValue::Text(text.clone())
-                    } else if let Some(file) = v
-                        .file
-                        .as_ref()
-                        .filter(|file| !file.path.as_os_str().is_empty())
-                    {
+                    } else if let Some(file) = &v.file {
                         FormValue::File(Some(FileData::new(file.clone())))
                     } else {
                         FormValue::File(None)
@@ -298,6 +317,7 @@ mod serialize {
 #[cfg(all(test, feature = "serialize"))]
 mod tests {
     use super::*;
+    use crate::SerializedFileData;
 
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
@@ -312,6 +332,7 @@ mod tests {
                 {
                     "key": "files",
                     "file": {
+                        "name": "Cargo.toml",
                         "path": path,
                         "size": contents.len(),
                         "last_modified": 123,
@@ -342,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_file_value_remains_unselected() {
+    fn empty_metadata_does_not_make_a_present_file_unselected() {
         let data = FormData::from(SerializedFormData::new(
             String::new(),
             vec![SerializedFormObject {
@@ -352,7 +373,16 @@ mod tests {
             }],
         ));
 
-        assert_eq!(data.get_first("files"), Some(FormValue::File(None)));
+        let Some(FormValue::File(Some(file))) = data.get_first("files") else {
+            panic!("present file metadata must remain selected");
+        };
+        assert_eq!(data.files(), vec![file.clone()]);
+        assert!(file.name().is_empty());
+        assert!(file.path().as_os_str().is_empty());
+        assert_eq!(file.size(), 0);
+        let parsed: std::collections::BTreeMap<String, Option<SerializedFileData>> =
+            data.deserialize_values().unwrap();
+        assert_eq!(parsed["files"], Some(SerializedFileData::empty()));
     }
 
     #[test]
@@ -364,8 +394,65 @@ mod tests {
 
         assert_eq!(data.get_first("uploads"), Some(FormValue::File(None)));
         assert!(data.files().is_empty());
-        let parsed: std::collections::BTreeMap<String, crate::SerializedFileData> =
-            data.parsed_values().unwrap();
-        assert_eq!(parsed["uploads"], crate::SerializedFileData::empty());
+        let parsed: std::collections::BTreeMap<String, Option<SerializedFileData>> =
+            data.deserialize_values().unwrap();
+        assert_eq!(parsed["uploads"], None);
+        assert!(!parsed.contains_key("missing"));
+        assert!(
+            data.deserialize_values::<std::collections::BTreeMap<String, SerializedFileData>>()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn repeated_file_values_preserve_unselected_entries_when_parsed() {
+        #[derive(serde::Deserialize)]
+        struct Fields {
+            uploads: Vec<Option<SerializedFileData>>,
+            missing: Option<SerializedFileData>,
+        }
+
+        let selected = SerializedFileData {
+            name: "empty.txt".into(),
+            ..SerializedFileData::empty()
+        };
+        let data = FormData::new(SerializedFormData::new(
+            String::new(),
+            [None, Some(selected.clone()), None]
+                .into_iter()
+                .map(|file| SerializedFormObject {
+                    key: "uploads".into(),
+                    text: None,
+                    file,
+                })
+                .collect(),
+        ));
+        let parsed: Fields = data.deserialize_values().unwrap();
+        assert_eq!(parsed.uploads, vec![None, Some(selected), None]);
+        assert_eq!(parsed.missing, None);
+    }
+
+    #[test]
+    fn named_file_without_a_path_remains_selected_after_form_serialization() {
+        let form = FormData::new(SerializedFormData::new(
+            String::new(),
+            vec![SerializedFormObject {
+                key: "upload".into(),
+                text: None,
+                file: Some(SerializedFileData {
+                    name: "empty.txt".into(),
+                    ..SerializedFileData::empty()
+                }),
+            }],
+        ));
+        let json = serde_json::to_value(form).unwrap();
+        assert_eq!(json["values"][0]["file"]["name"], "empty.txt");
+        let form: FormData = serde_json::from_value(json).unwrap();
+        let Some(FormValue::File(Some(file))) = form.get_first("upload") else {
+            panic!("a named zero-byte file should remain selected");
+        };
+        assert_eq!(file.name(), "empty.txt");
+        assert!(file.path().as_os_str().is_empty());
+        assert_eq!(file.size(), 0);
     }
 }

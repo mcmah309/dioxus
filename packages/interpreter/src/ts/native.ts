@@ -4,7 +4,7 @@
 // provide since it doesn't have access to the dom.
 
 import { BaseInterpreter, NodeId } from "./core";
-import { serializeEvent, SerializedFormObject } from "./serialize";
+import { EventSerializer, SerializedFormObject } from "./serialize";
 
 // okay so, we've got this JSChannel thing from sledgehammer, implicitly imported into our scope
 // we want to extend it, and it technically extends base interpreter. To make typescript happy,
@@ -26,6 +26,7 @@ export class NativeInterpreter extends JSChannel_ {
   headless: boolean;
   kickStylesheets: boolean;
   queuedBytes: ArrayBuffer[] = [];
+  private serializer = new EventSerializer(this);
 
   // eventually we want to remove liveview and build it into the server-side-events of fullstack
   // however, for now we need to support it since WebSockets in fullstack doesn't exist yet
@@ -94,7 +95,7 @@ export class NativeInterpreter extends JSChannel_ {
             // Send a message to the host to open the file dialog if the target is a file input and has a dioxus id attached to it
             event.preventDefault();
 
-            const contents = serializeEvent(event, target);
+            const contents = this.serializer.serializeEvent(event, target);
 
             const target_name = target.getAttribute("name") || "";
 
@@ -115,13 +116,13 @@ export class NativeInterpreter extends JSChannel_ {
               // Create a new DataTransfer to hold the files
               const dataTransfer = new DataTransfer();
 
-              // We name the file the path, so we can just use the path as the name later on.
               for (let formObject of formObjects) {
                 if (formObject.key == target_name && formObject.file != null) {
-                  const file = new File([], formObject.file.path, {
+                  const file = new File([], formObject.file.name, {
                     type: formObject.file.content_type,
                     lastModified: formObject.file.last_modified,
                   });
+                  this.serializer.registerDesktopFile(file, formObject.file);
                   dataTransfer.items.add(file);
                 }
               }
@@ -328,7 +329,7 @@ export class NativeInterpreter extends JSChannel_ {
     const target = event.target!;
     const element = getTargetId(target)!;
     const files: File[] = [];
-    const contents = serializeEvent(event, target, files);
+    const contents = this.serializer.serializeEvent(event, target, files);
 
     const body: SerializedHtmlEvent = {
       name,

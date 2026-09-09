@@ -11,7 +11,7 @@ use crate::{element::DesktopElement, file_upload::DesktopFormData};
 use base64::prelude::BASE64_STANDARD;
 use dioxus_core::{RenderTargetId, Runtime, VirtualDom};
 use dioxus_hooks::to_owned;
-use dioxus_html::{HtmlEvent, PlatformEventData, SerializedFileData};
+use dioxus_html::{HtmlEvent, PlatformEventData};
 use std::rc::Rc;
 use std::sync::{Arc, atomic::AtomicBool};
 use std::{cell::OnceCell, time::Duration};
@@ -162,31 +162,11 @@ impl WebviewEdits {
                 // we want to override this with a native file engine, provided by the most recent drag event
                 let full_file_paths = hovered_file.current_paths();
 
-                let xfer_data = drag.data_transfer.clone();
-                let new_file_data = xfer_data
-                    .files
-                    .iter()
-                    .map(|f| {
-                        let new_path = full_file_paths
-                            .iter()
-                            .find(|p| p.ends_with(&f.path))
-                            .unwrap_or(&f.path);
-                        SerializedFileData {
-                            path: new_path.clone(),
-                            ..f.clone()
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                let new_xfer_data = dioxus_html::SerializedDataTransfer {
-                    files: new_file_data,
-                    ..xfer_data
-                };
-
-                Rc::new(PlatformEventData::new(Box::new(DesktopFileDragEvent {
-                    mouse: drag.mouse.clone(),
-                    data_transfer: new_xfer_data,
-                    files: full_file_paths,
-                })))
+                Rc::new(PlatformEventData::new(Box::new(DesktopFileDragEvent::new(
+                    drag.mouse.clone(),
+                    drag.data_transfer.clone(),
+                    full_file_paths,
+                ))))
             }
             _ => data.into_any(),
         };

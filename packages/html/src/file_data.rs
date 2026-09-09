@@ -2,6 +2,7 @@ use bytes::Bytes;
 use futures_util::Stream;
 use std::{path::PathBuf, pin::Pin, prelude::rust_2024::Future};
 
+/// An owned file handle provided by a renderer.
 #[derive(Clone)]
 pub struct FileData {
     inner: std::sync::Arc<dyn NativeFileData>,
@@ -18,6 +19,7 @@ impl FileData {
         self.inner.content_type()
     }
 
+    /// Returns the filename reported by the renderer.
     pub fn name(&self) -> String {
         self.inner.name()
     }
@@ -49,6 +51,15 @@ impl FileData {
         self.inner.inner()
     }
 
+    /// Returns a filesystem path, or an empty path when unavailable.
+    ///
+    /// - Desktop returns the local filesystem path.
+    /// - Web always returns an empty path. Use [`Self::name`] for the filename.
+    /// - Liveview returns an empty path until the upload completes successfully, then
+    ///   the server's temporary file path. The path stays empty while the upload is
+    ///   pending or if the transfer fails or the contents are unavailable. An upload is
+    ///   lazily trigged by the first read of the data. Keep an original liveview file handle
+    ///   alive while using its temporary path. Use [`Self::name`] to obtain the browser's filename.
     pub fn path(&self) -> PathBuf {
         self.inner.path()
     }
@@ -107,12 +118,12 @@ pub use serialize::*;
 #[cfg(feature = "serialize")]
 mod serialize {
     use super::*;
-    use serde::Deserialize;
-    use std::cell::RefCell;
 
     /// A serializable representation of file metadata
     #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Clone)]
     pub struct SerializedFileData {
+        /// The original filename, independent of the file's storage path.
+        pub name: String,
         pub path: PathBuf,
         pub size: u64,
         pub last_modified: u64,
@@ -123,6 +134,7 @@ mod serialize {
         /// Create a new empty serialized file data object
         pub fn empty() -> Self {
             Self {
+                name: String::new(),
                 path: PathBuf::new(),
                 size: 0,
                 last_modified: 0,
@@ -133,6 +145,7 @@ mod serialize {
         /// Create serialized file metadata without eagerly reading the file contents.
         pub(crate) fn from_file_data(file_data: &FileData) -> Self {
             Self {
+                name: file_data.name(),
                 path: file_data.path(),
                 size: file_data.size(),
                 last_modified: file_data.last_modified(),
@@ -143,11 +156,7 @@ mod serialize {
 
     impl NativeFileData for SerializedFileData {
         fn name(&self) -> String {
-            self.path()
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned()
+            self.name.clone()
         }
 
         fn size(&self) -> u64 {
@@ -230,78 +239,41 @@ mod serialize {
         }
     }
 
-    pub(crate) const FILE_DATA_NEWTYPE: &str = "$dioxus::FileData";
+    #[cfg(test)]
+    mod tests {
+        use super::*;
 
-    thread_local! {
-        static FORM_FILES: RefCell<Vec<(FileData, SerializedFileData)>> = const { RefCell::new(Vec::new()) };
-    }
+        #[test]
+        fn serialized_names_remain_independent_of_paths() {
+            for (fields, expected) in [
+                (
+                    serde_json::json!({"name": "report.pdf", "path": "/tmp/upload-123"}),
+                    "report.pdf",
+                ),
+                (
+                    serde_json::json!({"name": "report.pdf", "path": ""}),
+                    "report.pdf",
+                ),
+                (
+                    serde_json::json!({"name": "", "path": "/tmp/upload-123"}),
+                    "",
+                ),
+                (serde_json::json!({"name": "", "path": ""}), ""),
+            ] {
+                let mut value = serde_json::to_value(SerializedFileData::empty()).unwrap();
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(fields.as_object().unwrap().clone());
+                let metadata: SerializedFileData = serde_json::from_value(value).unwrap();
+                assert_eq!(metadata.name(), expected);
 
-    // Serde's visitors only carry data-model values. During synchronous form parsing, the
-    // private FileData newtype transports an index into these handles instead of a raw path.
-    // Restore the previous context on errors, panics, and nested calls to parsed_values().
-    pub(crate) fn with_form_files<T>(
-        files: Vec<(FileData, SerializedFileData)>,
-        parse: impl FnOnce() -> T,
-    ) -> T {
-        struct RestoreFiles(Vec<(FileData, SerializedFileData)>);
-        impl Drop for RestoreFiles {
-            fn drop(&mut self) {
-                FORM_FILES.set(std::mem::take(&mut self.0));
+                let snapshot = SerializedFileData::from_file_data(&FileData::new(metadata));
+                let json = serde_json::to_value(snapshot).unwrap();
+                assert_eq!(json["name"], expected);
+                let round_trip: SerializedFileData = serde_json::from_value(json).unwrap();
+                assert_eq!(round_trip.name, expected);
             }
-        }
-        let _restore = RestoreFiles(FORM_FILES.replace(files));
-        parse()
-    }
-
-    impl<'de> serde::Deserialize<'de> for FileData {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: serde::Deserializer<'de>,
-        {
-            struct FileVisitor;
-            impl<'de> serde::de::Visitor<'de> for FileVisitor {
-                type Value = FileData;
-
-                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                    f.write_str("file metadata or an owned form file")
-                }
-
-                fn visit_u64<E: serde::de::Error>(self, index: u64) -> Result<FileData, E> {
-                    FORM_FILES.with(|files| {
-                        usize::try_from(index)
-                            .ok()
-                            .and_then(|index| {
-                                files.borrow().get(index).map(|(file, _)| file.clone())
-                            })
-                            .ok_or_else(|| E::custom("form file is no longer available"))
-                    })
-                }
-
-                fn visit_newtype_struct<D: serde::Deserializer<'de>>(
-                    self,
-                    deserializer: D,
-                ) -> Result<FileData, D::Error> {
-                    let metadata = SerializedFileData::deserialize(deserializer)?;
-                    // Untagged enums may buffer metadata before invoking this visitor. Match
-                    // the snapshot captured before parsing: a lazy file's path can change when
-                    // a concurrent read finishes. Unread files can have identical metadata, so
-                    // reject ambiguity instead of returning a different file's handle.
-                    FORM_FILES.with(|files| {
-                        let files = files.borrow();
-                        let mut matches = files.iter().filter(|(_, snapshot)| *snapshot == metadata);
-                        let Some((file, _)) = matches.next() else {
-                            return Ok(FileData::new(metadata));
-                        };
-                        if matches.any(|(other, _)| !std::sync::Arc::ptr_eq(&file.inner, &other.inner)) {
-                            return Err(serde::de::Error::custom(
-                                "buffered file metadata is ambiguous; deserialize FileData fields directly",
-                            ));
-                        }
-                        Ok(file.clone())
-                    })
-                }
-            }
-            deserializer.deserialize_newtype_struct(FILE_DATA_NEWTYPE, FileVisitor)
         }
     }
 }

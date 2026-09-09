@@ -552,7 +552,7 @@ mod tests {
             values.extend(files.iter().map(|(_, name, size)| {
                 serde_json::json!({
                     "key": "files", "file": {
-                        "path": name, "size": size, "last_modified": 123,
+                        "name": name, "path": "", "size": size, "last_modified": 123,
                         "content_type": "application/octet-stream",
                     },
                 })
@@ -645,6 +645,7 @@ mod tests {
                         .to_string()
                         .contains("upload data limit")
                 );
+                assert!(rejected.path().as_os_str().is_empty());
                 drop(rejected);
 
                 let mut first_read = first.byte_stream();
@@ -767,33 +768,53 @@ mod tests {
                 #[derive(Deserialize)]
                 struct Values {
                     description: String,
-                    files: Vec<dioxus_html::FileData>,
+                    files: Vec<dioxus_html::SerializedFileData>,
                 }
                 let uploads = crate::upload::FileUploadRegistry::default();
                 let mut client = TestConnection::new(uploads.clone());
                 let form = client
                     .select(&[(1, "hello.bin", 3), (2, "empty.bin", 0)])
                     .await;
-                let parsed: Values = form.parsed_values().unwrap();
+                let parsed: Values = form.deserialize_values().unwrap();
                 assert_eq!(parsed.description, "upload");
-                assert_eq!(parsed.files[0].name(), "hello.bin");
-                assert_eq!(parsed.files[0].size(), 3);
-                assert_eq!(parsed.files[0].last_modified(), 123);
+                assert_eq!(parsed.files.len(), 2);
+                assert_eq!(parsed.files[0].name, "hello.bin");
+                assert_eq!(parsed.files[1].name, "empty.bin");
+                assert_eq!(parsed.files[0].size, 3);
+                assert_eq!(parsed.files[1].size, 0);
+                assert!(
+                    parsed
+                        .files
+                        .iter()
+                        .all(|file| file.path.as_os_str().is_empty())
+                );
+                let files: Vec<_> = form
+                    .get("files")
+                    .into_iter()
+                    .map(|value| match value {
+                        dioxus_html::FormValue::File(Some(file)) => file,
+                        _ => panic!("expected a selected file"),
+                    })
+                    .collect();
+                assert_eq!(files[0].name(), "hello.bin");
+                assert_eq!(files[0].size(), 3);
+                assert_eq!(files[0].last_modified(), 123);
                 assert_eq!(
-                    parsed.files[0].content_type().as_deref(),
+                    files[0].content_type().as_deref(),
                     Some("application/octet-stream")
                 );
-                assert!(parsed.files[0].path().as_os_str().is_empty());
+                assert!(files[0].path().as_os_str().is_empty());
                 drop(form);
                 let again = client
                     .select(&[(1, "hello.bin", 3)])
                     .await
                     .files()
                     .remove(0);
-                let mut read = Box::pin(parsed.files[0].read_bytes());
-                let mut another_read = Box::pin(parsed.files[0].read_bytes());
+                let mut read = Box::pin(files[0].read_bytes());
+                let mut another_read = Box::pin(files[0].read_bytes());
                 assert!(futures_util::poll!(read.as_mut()).is_pending());
                 assert!(futures_util::poll!(another_read.as_mut()).is_pending());
+                assert!(files[0].path().as_os_str().is_empty());
                 let token = client.token(1).await;
                 // The existing read and the second, unread file both outlive their input.
                 client.unmount_input().await;
@@ -806,11 +827,12 @@ mod tests {
                 client.send("file_upload_complete", serde_json::json!({"token": token}));
                 assert_eq!(read.await.unwrap().as_ref(), &[0, 255, 128]);
                 assert_eq!(another_read.await.unwrap().as_ref(), &[0, 255, 128]);
+                assert!(files[0].path().is_file());
                 // The second event's handle reuses the first handle's transfer and storage.
-                assert_eq!(again.path(), parsed.files[0].path());
+                assert_eq!(again.path(), files[0].path());
                 assert_eq!(again.read_bytes().await.unwrap().as_ref(), &[0, 255, 128]);
                 drop(again);
-                let mut read = Box::pin(parsed.files[1].read_bytes());
+                let mut read = Box::pin(files[1].read_bytes());
                 assert!(futures_util::poll!(read.as_mut()).is_pending());
                 let token = client.token(2).await;
                 uploads
@@ -821,11 +843,18 @@ mod tests {
                     .unwrap();
                 client.send("file_upload_complete", serde_json::json!({"token": token}));
                 assert!(read.await.unwrap().is_empty());
-                assert_eq!(parsed.files[1].name(), "empty.bin");
-                let paths: Vec<_> = parsed.files.iter().map(|file| file.path()).collect();
+                assert_eq!(files[1].name(), "empty.bin");
+                let paths: Vec<_> = files.iter().map(|file| file.path()).collect();
                 assert!(paths.iter().all(|path| path.is_file()));
-                drop(parsed);
+                drop(files);
                 assert!(paths.iter().all(|path| !path.exists()));
+                // Parsed metadata remains a snapshot and does not retain uploaded storage.
+                assert!(
+                    parsed
+                        .files
+                        .iter()
+                        .all(|file| file.path.as_os_str().is_empty())
+                );
                 client.close().await;
             })
             .await;

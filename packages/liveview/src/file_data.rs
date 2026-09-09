@@ -28,9 +28,7 @@ impl LiveviewFormData {
                 });
                 let data = if let Some(text) = value.text {
                     FormValue::Text(text)
-                } else if let Some(file) =
-                    file.filter(|file| !file.metadata.path.as_os_str().is_empty())
-                {
+                } else if let Some(file) = file {
                     FormValue::File(Some(FileData::new(file)))
                 } else {
                     FormValue::File(None)
@@ -108,12 +106,7 @@ impl FileStorage {
 
 impl NativeFileData for LiveviewFileData {
     fn name(&self) -> String {
-        self.metadata
-            .path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned()
+        self.metadata.name.clone()
     }
 
     fn size(&self) -> u64 {
@@ -200,7 +193,7 @@ mod tests {
         #[derive(serde::Deserialize)]
         struct Fields {
             description: String,
-            upload: SerializedFileData,
+            upload: Option<SerializedFileData>,
         }
 
         let serialized: SerializedFormData = serde_json::from_value(serde_json::json!({
@@ -221,10 +214,64 @@ mod tests {
             assert_eq!(form.get_first("upload"), Some(FormValue::File(None)));
             assert!(form.get_first("missing").is_none());
             assert!(form.files().is_empty());
-            let fields: Fields = form.parsed_values().unwrap();
+            let fields: Fields = form.deserialize_values().unwrap();
             assert!(fields.description.is_empty());
-            assert_eq!(fields.upload, SerializedFileData::empty());
+            assert_eq!(fields.upload, None);
+
+            let json = serde_json::to_value(form).unwrap();
+            assert_eq!(json["values"][1]["file"], serde_json::Value::Null);
+            let restored: dioxus_html::FormData = serde_json::from_value(json).unwrap();
+            assert_eq!(restored.get_first("upload"), Some(FormValue::File(None)));
+            assert!(restored.files().is_empty());
         }
+    }
+
+    #[test]
+    fn buffered_metadata_preserves_names_and_duplicates() {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum BufferedFile {
+            File(SerializedFileData),
+        }
+
+        #[derive(serde::Deserialize)]
+        struct Fields {
+            files: Vec<BufferedFile>,
+        }
+
+        // Preserve names without resolving metadata back to handles, even for duplicates.
+        let names = ["first.txt", "second.txt", "first.txt", ""];
+        let serialized = SerializedFormData::new(
+            String::new(),
+            names
+                .into_iter()
+                .map(|name| dioxus_html::SerializedFormObject {
+                    key: "files".into(),
+                    text: None,
+                    file: Some(SerializedFileData {
+                        name: name.into(),
+                        size: 5,
+                        ..SerializedFileData::empty()
+                    }),
+                })
+                .collect(),
+        );
+        let form = dioxus_html::FormData::new(LiveviewFormData::new(serialized, Vec::new()));
+        let fields: Fields = form.deserialize_values().unwrap();
+        assert_eq!(fields.files.len(), names.len());
+        for (BufferedFile::File(file), name) in fields.files.into_iter().zip(names) {
+            assert!(file.path.as_os_str().is_empty());
+            assert_eq!(file.name, name);
+            assert_eq!(file.size, 5);
+        }
+
+        let Some(FormValue::File(Some(first))) = form.get_first("files") else {
+            panic!("expected a selected file");
+        };
+        let files = form.files();
+        drop(form);
+        assert_eq!(first.name(), "first.txt");
+        assert_eq!(files[1].name(), "second.txt");
     }
 
     async fn uploaded_file(contents: Bytes) -> (FileData, FileUploadRegistry, UploadSession) {
@@ -238,13 +285,35 @@ mod tests {
         let storage = registry.take_completed(&token).unwrap();
         let file = FileData::new(LiveviewFileData {
             metadata: SerializedFileData {
-                path: "browser-name.txt".into(),
+                name: "browser-name.txt".into(),
                 size: contents.len() as u64,
                 ..SerializedFileData::empty()
             },
             storage: FileStorage::Available(storage),
         });
         (file, registry, session)
+    }
+
+    #[tokio::test]
+    async fn parsed_uploaded_metadata_preserves_name_without_owning_storage() {
+        #[derive(serde::Deserialize)]
+        struct Fields {
+            upload: SerializedFileData,
+        }
+
+        let (file, _registry, _session) = uploaded_file(Bytes::from_static(b"hello")).await;
+        let path = file.path();
+        let form = dioxus_html::FormData::new(LiveviewFormData {
+            value: String::new(),
+            valid: true,
+            values: vec![("upload".into(), FormValue::File(Some(file)))],
+        });
+        let fields: Fields = form.deserialize_values().unwrap();
+        assert_eq!(fields.upload.name, "browser-name.txt");
+        assert_eq!(fields.upload.path, path);
+        drop(form);
+        assert!(!path.exists());
+        assert_eq!(fields.upload.name, "browser-name.txt");
     }
 
     #[tokio::test]
@@ -320,6 +389,7 @@ mod tests {
                     key: "file".to_string(),
                     text: None,
                     file: Some(SerializedFileData {
+                        name: "client-file.txt".into(),
                         path: server_file.path().to_path_buf(),
                         size: 11,
                         ..SerializedFileData::empty()

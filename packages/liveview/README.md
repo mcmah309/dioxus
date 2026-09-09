@@ -107,14 +107,40 @@ or cancellation. A handle caches either the completed file or the transfer error
 temporary file, then reads it in bounded chunks. `read_bytes()` and `read_string()`
 load the downloaded contents into memory. `name()` preserves the browser's filename;
 `path()` is empty until the transfer completes successfully, then returns the
-server's temporary path. Keep a `FileData` handle alive while using that path. Browser-supplied paths
-are never treated as server filesystem paths.
+server's temporary path. Calling `path()` does not start or wait for a transfer;
+it stays empty while uploading or if the transfer fails. A read through another
+handle to the same file can also make the path available. Keep an original
+`FileData` handle alive while using that path. Browser-supplied paths are never
+treated as server filesystem paths.
 
-`FormData::parsed_values()` preserves the original handles for `FileData` fields,
-including lazy reads, filenames, and quota ownership after the form event is dropped.
-Parsing into `SerializedFileData` keeps metadata only. Schemas that buffer metadata,
-such as untagged enums, must distinguish the files; ambiguous metadata returns a
-parsing error instead of selecting another file.
+`FormData::parsed_values()` deserializes text fields and file metadata. Use
+`SerializedFileData` for metadata fields. Its `name` preserves the original browser
+filename even when `path` is empty or points to a temporary server file.
+For an optional upload, use `Option<SerializedFileData>`: an unselected input
+parses as `None`, while a selected zero-byte file parses as `Some(metadata)`.
+`FileData` does not implement `Deserialize`; structs parsed with `parsed_values()`
+must use `SerializedFileData` for file metadata.
+Obtain the original handles with `get_first("input_name")`, `get("input_name")`, or
+`files()`. These handles retain lazy reads, filenames, and quota ownership after the
+form event is dropped:
+
+```rust
+use dioxus_html::{FormData, FormValue};
+
+#[derive(serde::Deserialize)]
+struct Fields {
+    description: String,
+}
+
+async fn submit(form: &FormData) -> Result<(), dioxus_core::CapturedError> {
+    let fields: Fields = form.parsed_values()?;
+    if let Some(FormValue::File(Some(file))) = form.get_first("upload") {
+        let contents = file.read_bytes().await?;
+        println!("{}: {} bytes for {}", file.name(), contents.len(), fields.description);
+    }
+    Ok(())
+}
+```
 
 If you construct your own `VirtualDom`, call `view.run(vdom, socket).await` on your
 local executor and pass `view.clone()` to `axum_file_upload`. Both handlers must use

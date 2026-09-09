@@ -358,6 +358,48 @@ pub(crate) struct DesktopFileDragEvent {
     pub files: Vec<PathBuf>,
 }
 
+impl DesktopFileDragEvent {
+    /// The browser usually reports a dropped file's name, but Rust needs its full
+    /// filesystem path to open it. Find that path in the list provided by Wry.
+    /// For duplicate names without paths, assume the first browser file corresponds
+    /// to the first remaining native path with that name, and so on.
+    pub(crate) fn new(
+        mouse: SerializedPointInteraction,
+        mut data_transfer: SerializedDataTransfer,
+        native_paths: Vec<PathBuf>,
+    ) -> Self {
+        // Reserve paths already supplied by native file dialogs.
+        let mut remaining_native_paths: Vec<&PathBuf> = native_paths
+            .iter()
+            .filter(|native_path| {
+                !data_transfer
+                    .files
+                    .iter()
+                    .any(|file| file.path.as_path() == native_path.as_path())
+            })
+            .collect();
+        for browser_file in &mut data_transfer.files {
+            if !browser_file.path.as_os_str().is_empty() {
+                continue;
+            }
+            let matching_path_index = remaining_native_paths.iter().position(|native_path| {
+                native_path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy() == browser_file.name)
+            });
+            if let Some(path_index) = matching_path_index {
+                // Consume each native entry once, keeping duplicate filenames distinct.
+                browser_file.path = remaining_native_paths.remove(path_index).clone();
+            }
+        }
+        Self {
+            mouse,
+            data_transfer,
+            files: native_paths,
+        }
+    }
+}
+
 impl HasFileData for DesktopFileDragEvent {
     fn files(&self) -> Vec<FileData> {
         self.files
@@ -509,12 +551,98 @@ mod tests {
     use dioxus_html::{FormData, SerializedFileData};
     use futures_util::FutureExt;
 
+    fn duplicate_filename_files() -> (tempfile::TempDir, [PathBuf; 2]) {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = ["first", "second"].map(|name| {
+            let parent = directory.path().join(name);
+            std::fs::create_dir(&parent).unwrap();
+            let path = parent.join("report.txt");
+            std::fs::write(&path, name).unwrap();
+            path
+        });
+        (directory, paths)
+    }
+
+    fn transferred_files(paths: Vec<PathBuf>, native_paths: Vec<PathBuf>) -> Vec<FileData> {
+        DesktopFileDragEvent::new(
+            SerializedPointInteraction::default(),
+            SerializedDataTransfer {
+                items: Vec::new(),
+                files: paths
+                    .into_iter()
+                    .map(|path| SerializedFileData {
+                        name: "report.txt".into(),
+                        path,
+                        ..SerializedFileData::empty()
+                    })
+                    .collect(),
+                effect_allowed: "all".into(),
+                drop_effect: "copy".into(),
+            },
+            native_paths,
+        )
+        .data_transfer()
+        .files()
+    }
+
+    #[test]
+    fn dropped_files_with_duplicate_names_remain_separately_readable() {
+        let (_directory, paths) = duplicate_filename_files();
+        let files = transferred_files(vec![PathBuf::new(); 3], paths.to_vec());
+        assert_eq!(files.len(), 3);
+        for ((file, path), contents) in files.iter().zip(&paths).zip(["first", "second"]) {
+            assert_eq!(&file.path(), path);
+            assert_eq!(
+                file.read_string().now_or_never().unwrap().unwrap(),
+                contents
+            );
+        }
+        // An unmatched entry must not reuse either of the native selections.
+        assert!(files[2].path().as_os_str().is_empty());
+        assert!(files[2].read_bytes().now_or_never().unwrap().is_err());
+    }
+
+    #[test]
+    fn dropped_files_preserve_known_paths_without_reordering() {
+        let (_directory, [first, second]) = duplicate_filename_files();
+        for paths in [
+            vec![second.clone(), first.clone()],
+            vec![PathBuf::new(), first.clone()],
+        ] {
+            let files = transferred_files(paths, vec![first.clone(), second.clone()]);
+            assert_eq!(files[0].path(), second);
+            assert_eq!(files[1].path(), first);
+            assert_eq!(
+                files[0].read_string().now_or_never().unwrap().unwrap(),
+                "second"
+            );
+            assert_eq!(
+                files[1].read_string().now_or_never().unwrap().unwrap(),
+                "first"
+            );
+        }
+    }
+
+    #[test]
+    fn internal_drags_preserve_known_native_paths() {
+        let (_directory, [first, second]) = duplicate_filename_files();
+        // Native hover paths may be absent or left over from a previous OS drag.
+        for native_paths in [Vec::new(), vec![second]] {
+            let files = transferred_files(vec![first.clone()], native_paths);
+            assert_eq!(files[0].path(), first);
+            assert_eq!(
+                files[0].read_string().now_or_never().unwrap().unwrap(),
+                "first"
+            );
+        }
+    }
+
     #[test]
     fn unselected_files_and_empty_text_match_serialized_form_data() {
         #[derive(Deserialize)]
         struct Fields {
             description: String,
-            upload: SerializedFileData,
+            upload: Option<SerializedFileData>,
         }
 
         // The shared interpreter sends an unselected file as a field with neither text nor file.
@@ -536,9 +664,9 @@ mod tests {
             assert_eq!(form.get_first("upload"), Some(FormValue::File(None)));
             assert!(form.get_first("missing").is_none());
             assert!(form.files().is_empty());
-            let fields: Fields = form.parsed_values().unwrap();
+            let fields: Fields = form.deserialize_values().unwrap();
             assert!(fields.description.is_empty());
-            assert_eq!(fields.upload, SerializedFileData::empty());
+            assert_eq!(fields.upload, None);
         }
     }
 
@@ -546,7 +674,7 @@ mod tests {
     fn selected_zero_byte_files_can_be_parsed_and_read() {
         #[derive(Deserialize)]
         struct Fields {
-            upload: FileData,
+            upload: SerializedFileData,
         }
 
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -554,6 +682,7 @@ mod tests {
             "values": [{
                 "key": "upload",
                 "file": {
+                    "name": file.path().file_name().unwrap().to_string_lossy(),
                     "path": file.path(), "size": 0, "last_modified": 0,
                     "content_type": "application/octet-stream"
                 }
@@ -569,13 +698,12 @@ mod tests {
             };
             assert_eq!(form.files(), vec![selected.clone()]);
             assert_eq!(selected.size(), 0);
-            let fields: Fields = form.parsed_values().unwrap();
+            let fields: Fields = form.deserialize_values().unwrap();
             drop(form);
-            assert_eq!(fields.upload.path(), file.path());
-            assert_eq!(fields.upload.name(), selected.name());
+            assert_eq!(fields.upload.path, file.path());
+            assert_eq!(fields.upload.name, selected.name());
             assert!(
-                fields
-                    .upload
+                selected
                     .read_bytes()
                     .now_or_never()
                     .unwrap()
