@@ -37,6 +37,7 @@ generational-box = { workspace = true }
 
 # axum
 axum = { workspace = true, optional = true, default-features = true, features = ["ws"] }
+dioxus-fullstack = { workspace = true, optional = true, features = ["server"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
@@ -47,7 +48,7 @@ dioxus = { workspace = true }
 
 [features]
 default = ["devtools", "multi-thread"]
-axum = ["dep:axum"]
+axum = ["dep:axum", "dep:dioxus-fullstack"]
 multi-thread = ["tokio/rt-multi-thread"]
 devtools = ["dep:dioxus-devtools"]
 
